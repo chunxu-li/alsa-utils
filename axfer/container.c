@@ -13,6 +13,7 @@
 #include <errno.h>
 #include <string.h>
 #include <fcntl.h>
+#include <inttypes.h>
 
 static const char *const cntr_type_labels[] = {
 	[CONTAINER_TYPE_PARSER] = "parser",
@@ -142,8 +143,8 @@ static int set_nonblock_flag(int fd)
 	return 0;
 }
 
-int container_parser_init(struct container_context *cntr,
-			  const char *const path, unsigned int verbose)
+int container_parser_init(struct container_context *cntr, int fd,
+			  unsigned int verbose)
 {
 	const struct container_parser *parsers[] = {
 		[CONTAINER_FORMAT_RIFF_WAVE] = &container_parser_riff_wave,
@@ -156,8 +157,7 @@ int container_parser_init(struct container_context *cntr,
 	int err;
 
 	assert(cntr);
-	assert(path);
-	assert(path[0] != '\0');
+	assert(fd >= 0);
 
 	// Detect forgotten to destruct.
 	assert(cntr->fd == 0);
@@ -165,9 +165,10 @@ int container_parser_init(struct container_context *cntr,
 
 	memset(cntr, 0, sizeof(*cntr));
 
-	// Open a target descriptor.
-	if (!strcmp(path, "-")) {
-		cntr->fd = fileno(stdin);
+	cntr->fd = fd;
+
+	cntr->stdio = (cntr->fd == fileno(stdin));
+	if (cntr->stdio) {
 		if (isatty(cntr->fd)) {
 			fprintf(stderr,
 				"A terminal is referred for standard input. "
@@ -175,15 +176,11 @@ int container_parser_init(struct container_context *cntr,
 				"should be referred instead.\n");
 			return -EIO;
 		}
-		err = set_nonblock_flag(cntr->fd);
-		if (err < 0)
-			return err;
-		cntr->stdio = true;
-	} else {
-		cntr->fd = open(path, O_RDONLY | O_NONBLOCK);
-		if (cntr->fd < 0)
-			return -errno;
 	}
+
+	err = set_nonblock_flag(cntr->fd);
+	if (err < 0)
+		return err;
 
 	// 4 bytes are enough to detect supported containers.
 	err = container_recursive_read(cntr, cntr->magic, sizeof(cntr->magic));
@@ -224,9 +221,8 @@ int container_parser_init(struct container_context *cntr,
 	return 0;
 }
 
-int container_builder_init(struct container_context *cntr,
-			   const char *const path, enum container_format format,
-			   unsigned int verbose)
+int container_builder_init(struct container_context *cntr, int fd,
+			   enum container_format format, unsigned int verbose)
 {
 	const struct container_builder *builders[] = {
 		[CONTAINER_FORMAT_RIFF_WAVE] = &container_builder_riff_wave,
@@ -238,8 +234,7 @@ int container_builder_init(struct container_context *cntr,
 	int err;
 
 	assert(cntr);
-	assert(path);
-	assert(path[0] != '\0');
+	assert(fd >= 0);
 
 	// Detect forgotten to destruct.
 	assert(cntr->fd == 0);
@@ -247,11 +242,10 @@ int container_builder_init(struct container_context *cntr,
 
 	memset(cntr, 0, sizeof(*cntr));
 
-	// Open a target descriptor.
-	if (path == NULL || *path == '\0')
-		return -EINVAL;
-	if (!strcmp(path, "-")) {
-		cntr->fd = fileno(stdout);
+	cntr->fd = fd;
+
+	cntr->stdio = (cntr->fd == fileno(stdout));
+	if (cntr->stdio) {
 		if (isatty(cntr->fd)) {
 			fprintf(stderr,
 				"A terminal is referred for standard output. "
@@ -259,16 +253,11 @@ int container_builder_init(struct container_context *cntr,
 				"should be referred instead.\n");
 			return -EIO;
 		}
-		err = set_nonblock_flag(cntr->fd);
-		if (err < 0)
-			return err;
-		cntr->stdio = true;
-	} else {
-		cntr->fd = open(path, O_RDWR | O_NONBLOCK | O_CREAT | O_TRUNC,
-				0644);
-		if (cntr->fd < 0)
-			return -errno;
 	}
+
+	err = set_nonblock_flag(cntr->fd);
+	if (err < 0)
+		return err;
 
 	builder = builders[format];
 
@@ -356,10 +345,10 @@ int container_context_pre_process(struct container_context *cntr,
 		fprintf(stderr, "  frames/second: %u\n",
 			cntr->frames_per_second);
 		if (cntr->type == CONTAINER_TYPE_PARSER) {
-			fprintf(stderr, "  frames: %lu\n",
+			fprintf(stderr, "  frames: %" PRIu64 "\n",
 				*frame_count);
 		} else {
-			fprintf(stderr, "  max frames: %lu\n",
+			fprintf(stderr, "  max frames: %" PRIu64 "\n",
 				*frame_count);
 		}
 	}
@@ -427,7 +416,7 @@ int container_context_post_process(struct container_context *cntr,
 	assert(frame_count);
 
 	if (cntr->verbose && cntr->handled_byte_count > 0) {
-		fprintf(stderr, "  Handled bytes: %lu\n",
+		fprintf(stderr, "  Handled bytes: %" PRIu64 "\n",
 			cntr->handled_byte_count);
 	}
 
@@ -462,7 +451,6 @@ void container_context_destroy(struct container_context *cntr)
 {
 	assert(cntr);
 
-	close(cntr->fd);
 	if (cntr->private_data)
 		free(cntr->private_data);
 

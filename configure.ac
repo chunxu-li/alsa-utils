@@ -1,6 +1,6 @@
 dnl Process this file with autoconf to produce a configure script.
 AC_PREREQ(2.59)
-AC_INIT(alsa-utils, 1.1.9)
+AC_INIT(alsa-utils, 1.2.6)
 AC_CONFIG_SRCDIR([aplay/aplay.c])
 AC_PREFIX_DEFAULT(/usr)
 AM_INIT_AUTOMAKE
@@ -19,7 +19,7 @@ AC_PROG_MKDIR_P
 AC_PROG_LN_S
 AC_PROG_SED
 PKG_PROG_PKG_CONFIG
-AM_PATH_ALSA(1.0.27)
+AM_PATH_ALSA(1.2.5)
 if test "x$enable_alsatest" = "xyes"; then
 AC_CHECK_FUNC([snd_ctl_elem_add_enumerated],
 	      , [AC_ERROR([No user enum control support in alsa-lib])])
@@ -49,6 +49,7 @@ AC_CHECK_LIB([asound], [snd_seq_client_info_get_pid], [HAVE_SEQ_CLIENT_INFO_GET_
 if test "$HAVE_SEQ_CLIENT_INFO_GET_PID" = "yes" ; then
     AC_DEFINE([HAVE_SEQ_CLIENT_INFO_GET_PID], 1, [alsa-lib supports snd_seq_client_info_get_pid])
 fi
+AC_CHECK_LIB([atopology], [snd_tplg_save], [have_topology="yes"], [have_topology="no"])
 
 #
 # NOTE: The library 'libffado' (at least v2.4.1) executes ctor/dtor of instances
@@ -60,6 +61,11 @@ fi
 AC_CHECK_LIB([ffado], [ffado_streaming_init], [have_ffado="yes"], [have_ffado="no"])
 AS_IF([test x"$have_ffado" = xyes],
       [AC_DEFINE([WITH_FFADO], [1], [Define if FFADO library is available])])
+
+# Test programs for axfer use shm by memfd_create(2). If not supported, open(2) is used alternatively.
+AC_CHECK_FUNC([memfd_create], [have_memfd_create="yes"], [have_memfd_create="no"])
+AS_IF([test x$have_memfd_create = xyes],
+      [AC_DEFINE([HAVE_MEMFD_CREATE], [1], [Define if Linux kernel supports memfd_create system call])])
 
 AM_CONDITIONAL(HAVE_PCM, test "$have_pcm" = "yes")
 AM_CONDITIONAL(HAVE_MIXER, test "$have_mixer" = "yes")

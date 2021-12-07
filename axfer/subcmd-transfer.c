@@ -11,12 +11,15 @@
 #include "misc.h"
 
 #include <signal.h>
+#include <inttypes.h>
 
 struct context {
 	struct xfer_context xfer;
 	struct mapper_context mapper;
 	struct container_context *cntrs;
 	unsigned int cntr_count;
+
+	int *cntr_fds;
 
 	// NOTE: To handling Unix signal.
 	bool interrupted;
@@ -145,6 +148,20 @@ static int context_init(struct context *ctx, snd_pcm_stream_t direction,
 	return xfer_context_init(&ctx->xfer, xfer_type, direction, argc, argv);
 }
 
+static int allocate_containers(struct context *ctx, unsigned int count)
+{
+	ctx->cntrs = calloc(count, sizeof(*ctx->cntrs));
+	if (ctx->cntrs == NULL)
+		return -ENOMEM;
+	ctx->cntr_count = count;
+
+	ctx->cntr_fds = calloc(count, sizeof(*ctx->cntr_fds));
+	if (ctx->cntr_fds == NULL)
+		return -ENOMEM;
+
+	return 0;
+}
+
 static int capture_pre_process(struct context *ctx, snd_pcm_access_t *access,
 			       snd_pcm_uframes_t *frames_per_buffer,
 			       uint64_t *total_frame_count)
@@ -163,10 +180,9 @@ static int capture_pre_process(struct context *ctx, snd_pcm_access_t *access,
 		return err;
 
 	// Prepare for containers.
-	ctx->cntrs = calloc(ctx->xfer.path_count, sizeof(*ctx->cntrs));
-	if (ctx->cntrs == NULL)
-		return -ENOMEM;
-	ctx->cntr_count = ctx->xfer.path_count;
+	err = allocate_containers(ctx, ctx->xfer.path_count);
+	if (err < 0)
+		return err;
 
 	if (ctx->cntr_count > 1)
 		channels = 1;
@@ -175,10 +191,20 @@ static int capture_pre_process(struct context *ctx, snd_pcm_access_t *access,
 
 	*total_frame_count = 0;
 	for (i = 0; i < ctx->cntr_count; ++i) {
+		const char *path = ctx->xfer.paths[i];
+		int fd;
 		uint64_t frame_count;
 
-		err = container_builder_init(ctx->cntrs + i,
-					     ctx->xfer.paths[i],
+		if (!strcmp(path, "-")) {
+			fd = fileno(stdout);
+		} else {
+			fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+			if (fd < 0)
+				return -errno;
+		}
+		ctx->cntr_fds[i] = fd;
+
+		err = container_builder_init(ctx->cntrs + i, ctx->cntr_fds[i],
 					     ctx->xfer.cntr_format,
 					     ctx->xfer.verbose > 1);
 		if (err < 0)
@@ -211,19 +237,28 @@ static int playback_pre_process(struct context *ctx, snd_pcm_access_t *access,
 	int err;
 
 	// Prepare for containers.
-	ctx->cntrs = calloc(ctx->xfer.path_count, sizeof(*ctx->cntrs));
-	if (ctx->cntrs == NULL)
-		return -ENOMEM;
-	ctx->cntr_count = ctx->xfer.path_count;
+	err = allocate_containers(ctx, ctx->xfer.path_count);
+	if (err < 0)
+		return err;
 
 	for (i = 0; i < ctx->cntr_count; ++i) {
+		const char *path = ctx->xfer.paths[i];
+		int fd;
 		snd_pcm_format_t format;
 		unsigned int channels;
 		unsigned int rate;
 		uint64_t frame_count;
 
-		err = container_parser_init(ctx->cntrs + i,
-					    ctx->xfer.paths[i],
+		if (!strcmp(path, "-")) {
+			fd = fileno(stdin);
+		} else {
+			fd = open(path, O_RDONLY);
+			if (fd < 0)
+				return -errno;
+		}
+		ctx->cntr_fds[i] = fd;
+
+		err = container_parser_init(ctx->cntrs + i, ctx->cntr_fds[i],
 					    ctx->xfer.verbose > 1);
 		if (err < 0)
 			return err;
@@ -389,7 +424,8 @@ static int context_process_frames(struct context *ctx,
 
 	if (!ctx->xfer.quiet) {
 		fprintf(stderr,
-			"%s: Expected %lu frames, Actual %lu frames\n",
+			"%s: Expected %" PRIu64 "frames, "
+			"Actual %" PRIu64 "frames\n",
 			snd_pcm_stream_name(direction), expected_frame_count,
 			*actual_frame_count);
 		if (ctx->interrupted) {
@@ -417,6 +453,12 @@ static void context_post_process(struct context *ctx,
 			container_context_destroy(ctx->cntrs + i);
 		}
 		free(ctx->cntrs);
+	}
+
+	if (ctx->cntr_fds) {
+		for (i = 0; i < ctx->cntr_count; ++i)
+			close(ctx->cntr_fds[i]);
+		free(ctx->cntr_fds);
 	}
 
 	mapper_context_post_process(&ctx->mapper);

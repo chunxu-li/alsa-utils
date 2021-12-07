@@ -28,7 +28,7 @@
 #include <errno.h>
 #include <assert.h>
 #include <alsa/asoundlib.h>
-#include <sys/poll.h>
+#include <poll.h>
 #include <stdint.h>
 #include "amixer.h"
 #include "../alsamixer/volume_mapping.h"
@@ -81,6 +81,9 @@ static int help(void)
 	printf("  contents        show contents of all controls for given card\n");
 	printf("  cset cID P      set control contents for one control\n");
 	printf("  cget cID        get control contents for one control\n");
+	printf("\nAvailable advanced commands:\n");
+	printf("  sevents	  show the mixer events for simple controls\n");
+	printf("  events	  show the mixer events for simple controls\n");
 	return 0;
 }
 
@@ -192,16 +195,22 @@ static int convert_prange(long val, long min, long max)
 	int tmp;
 
 	if (range == 0)
-		return 0;
+		return min;
 	val -= min;
 	tmp = rint((double)val/(double)range * 100);
 	return tmp;
 }
 
-/* Function to convert from percentage to volume. val = percentage */
+/* Function to convert from percentage to volume. perc = percentage */
+static long convert_prange1(long perc, long min, long max)
+{
+	long tmp;
 
-#define convert_prange1(val, min, max) \
-	ceil((val) * ((max) - (min)) * 0.01 + (min))
+	tmp = rint((double)perc * (double)(max - min) * 0.01);
+	if (tmp == 0 && perc > 0)
+		tmp++;
+	return tmp + min;
+}
 
 struct volume_ops {
 	int (*get_range)(snd_mixer_elem_t *elem, long *min, long *max);
@@ -453,6 +462,7 @@ static void decode_tlv(unsigned int spaces, unsigned int *tlv, unsigned int tlv_
 	unsigned int size;
 	unsigned int idx = 0;
 	const char *chmap_type = NULL;
+	int lf = 1;
 
 	if (tlv_size < 2 * sizeof(unsigned int)) {
 		printf("TLV size error!\n");
@@ -464,7 +474,7 @@ static void decode_tlv(unsigned int spaces, unsigned int *tlv, unsigned int tlv_
 	size = tlv[idx++];
 	tlv_size -= 2 * sizeof(unsigned int);
 	if (size > tlv_size) {
-		printf("TLV size error (%i, %i, %i)!\n", type, size, tlv_size);
+		printf("TLV size error (%u, %u, %u)!\n", type, size, tlv_size);
 		return;
 	}
 	switch (type) {
@@ -480,6 +490,7 @@ static void decode_tlv(unsigned int spaces, unsigned int *tlv, unsigned int tlv_
 			decode_tlv(spaces + 2, tlv + idx, tlv[idx+1] + 8);
 			idx += 2 + (tlv[idx+1] + sizeof(unsigned int) - 1) / sizeof(unsigned int);
 		}
+		lf = 0;
 		break;
 	case SND_CTL_TLVT_DB_SCALE:
 		printf("dBscale-");
@@ -574,14 +585,15 @@ static void decode_tlv(unsigned int spaces, unsigned int *tlv, unsigned int tlv_
 		break;
 #endif
 	default:
-		printf("unk-%i-", type);
+		printf("unk-%u-", type);
 		while (size > 0) {
 			printf("0x%08x,", tlv[idx++]);
 			size -= sizeof(unsigned int);
 		}
 		break;
 	}
-	putc('\n', stdout);
+	if (lf)
+		putc('\n', stdout);
 }
 
 static int show_control(const char *space, snd_hctl_elem_t *elem,
@@ -608,7 +620,7 @@ static int show_control(const char *space, snd_hctl_elem_t *elem,
 	}
 	count = snd_ctl_elem_info_get_count(info);
 	type = snd_ctl_elem_info_get_type(info);
-	printf("%s; type=%s,access=%s,values=%i", space, control_type(info), control_access(info), count);
+	printf("%s; type=%s,access=%s,values=%u", space, control_type(info), control_access(info), count);
 	switch (type) {
 	case SND_CTL_ELEM_TYPE_INTEGER:
 		printf(",min=%li,max=%li,step=%li\n", 
@@ -617,7 +629,7 @@ static int show_control(const char *space, snd_hctl_elem_t *elem,
 		       snd_ctl_elem_info_get_step(info));
 		break;
 	case SND_CTL_ELEM_TYPE_INTEGER64:
-		printf(",min=%Li,max=%Li,step=%Li\n", 
+		printf(",min=%lli,max=%lli,step=%lli\n",
 		       snd_ctl_elem_info_get_min64(info),
 		       snd_ctl_elem_info_get_max64(info),
 		       snd_ctl_elem_info_get_step64(info));
@@ -659,7 +671,7 @@ static int show_control(const char *space, snd_hctl_elem_t *elem,
 				printf("%li", snd_ctl_elem_value_get_integer(control, idx));
 				break;
 			case SND_CTL_ELEM_TYPE_INTEGER64:
-				printf("%Li", snd_ctl_elem_value_get_integer64(control, idx));
+				printf("%lli", snd_ctl_elem_value_get_integer64(control, idx));
 				break;
 			case SND_CTL_ELEM_TYPE_ENUMERATED:
 				printf("%u", snd_ctl_elem_value_get_enumerated(control, idx));
@@ -1593,7 +1605,8 @@ static int events(int argc ATTRIBUTE_UNUSED, char *argv[] ATTRIBUTE_UNUSED)
 		if (res >= 0) {
 			printf("Poll ok: %i\n", res);
 			res = snd_hctl_handle_events(handle);
-			assert(res > 0);
+			if (res < 0)
+				printf("ERR: %s (%d)\n", snd_strerror(res), res);
 		}
 	}
 	snd_hctl_close(handle);
@@ -1762,7 +1775,7 @@ static int exec_stdin(void)
 
 int main(int argc, char *argv[])
 {
-	int morehelp, level = 0;
+	int badopt, retval, level = 0;
 	int read_stdin = 0;
 	static const struct option long_option[] =
 	{
@@ -1781,7 +1794,7 @@ int main(int argc, char *argv[])
 		{NULL, 0, NULL, 0},
 	};
 
-	morehelp = 0;
+	badopt = 0;
 	while (1) {
 		int c;
 
@@ -1796,10 +1809,14 @@ int main(int argc, char *argv[])
 				int i;
 				i = snd_card_get_index(optarg);
 				if (i >= 0 && i < 32)
+#if defined(SND_LIB_VER) && SND_LIB_VER(1, 2, 5) <= SND_LIB_VERSION
+					sprintf(card, "sysdefault:%i", i);
+#else
 					sprintf(card, "hw:%i", i);
+#endif
 				else {
-					fprintf(stderr, "Invalid card number.\n");
-					morehelp++;
+					fprintf(stderr, "Invalid card number '%s'.\n", optarg);
+					badopt++;
 				}
 			}
 			break;
@@ -1821,7 +1838,7 @@ int main(int argc, char *argv[])
 			break;
 		case 'v':
 			printf("amixer version " SND_UTIL_VERSION_STR "\n");
-			return 1;
+			return 0;
 		case 'a':
 			smixer_level = 1;
 			memset(&smixer_options, 0, sizeof(smixer_options));
@@ -1832,7 +1849,7 @@ int main(int argc, char *argv[])
 				smixer_options.abstract = SND_MIXER_SABSTRACT_BASIC;
 			else {
 				fprintf(stderr, "Select correct abstraction level (none or basic)...\n");
-				morehelp++;
+				badopt++;
 			}
 			break;
 		case 's':
@@ -1845,49 +1862,55 @@ int main(int argc, char *argv[])
 			std_vol_type = VOL_MAP;
 			break;
 		default:
-			fprintf(stderr, "Invalid switch or option needs an argument.\n");
-			morehelp++;
+			fprintf(stderr, "Invalid switch or option -%c needs an argument.\n", c);
+			badopt++;
 		}
 	}
-	if (morehelp) {
-		help();
+	if (badopt)
 		return 1;
-	}
+
 	smixer_options.device = card;
 
-	if (read_stdin)
-		return exec_stdin();
+	if (read_stdin) {
+		retval = exec_stdin();
+		goto finish;
+	}
 
 	if (argc - optind <= 0) {
-		return selems(LEVEL_BASIC | level) ? 1 : 0;
+		retval = selems(LEVEL_BASIC | level) ? 1 : 0;
+		goto finish;
 	}
 	if (!strcmp(argv[optind], "help")) {
-		return help() ? 1 : 0;
+		retval = help() ? 1 : 0;
 	} else if (!strcmp(argv[optind], "info")) {
-		return info() ? 1 : 0;
+		retval = info() ? 1 : 0;
 	} else if (!strcmp(argv[optind], "controls")) {
-		return controls(level) ? 1 : 0;
+		retval = controls(level) ? 1 : 0;
 	} else if (!strcmp(argv[optind], "contents")) {
-		return controls(LEVEL_BASIC | level) ? 1 : 0;
+		retval = controls(LEVEL_BASIC | level) ? 1 : 0;
 	} else if (!strcmp(argv[optind], "scontrols") || !strcmp(argv[optind], "simple")) {
-		return selems(level) ? 1 : 0;
+		retval = selems(level) ? 1 : 0;
 	} else if (!strcmp(argv[optind], "scontents")) {
-		return selems(LEVEL_BASIC | level) ? 1 : 0;
+		retval = selems(LEVEL_BASIC | level) ? 1 : 0;
 	} else if (!strcmp(argv[optind], "sset") || !strcmp(argv[optind], "set")) {
-		return sset(argc - optind - 1, argc - optind > 1 ? argv + optind + 1 : NULL, 0, 0) ? 1 : 0;
+		retval = sset(argc - optind - 1, argc - optind > 1 ? argv + optind + 1 : NULL, 0, 0) ? 1 : 0;
 	} else if (!strcmp(argv[optind], "sget") || !strcmp(argv[optind], "get")) {
-		return sset(argc - optind - 1, argc - optind > 1 ? argv + optind + 1 : NULL, 1, 0) ? 1 : 0;
+		retval = sset(argc - optind - 1, argc - optind > 1 ? argv + optind + 1 : NULL, 1, 0) ? 1 : 0;
 	} else if (!strcmp(argv[optind], "cset")) {
-		return cset(argc - optind - 1, argc - optind > 1 ? argv + optind + 1 : NULL, 0, 0) ? 1 : 0;
+		retval = cset(argc - optind - 1, argc - optind > 1 ? argv + optind + 1 : NULL, 0, 0) ? 1 : 0;
 	} else if (!strcmp(argv[optind], "cget")) {
-		return cset(argc - optind - 1, argc - optind > 1 ? argv + optind + 1 : NULL, 1, 0) ? 1 : 0;
+		retval = cset(argc - optind - 1, argc - optind > 1 ? argv + optind + 1 : NULL, 1, 0) ? 1 : 0;
 	} else if (!strcmp(argv[optind], "events")) {
-		return events(argc - optind - 1, argc - optind > 1 ? argv + optind + 1 : NULL);
+		retval = events(argc - optind - 1, argc - optind > 1 ? argv + optind + 1 : NULL);
 	} else if (!strcmp(argv[optind], "sevents")) {
-		return sevents(argc - optind - 1, argc - optind > 1 ? argv + optind + 1 : NULL);
+		retval = sevents(argc - optind - 1, argc - optind > 1 ? argv + optind + 1 : NULL);
 	} else {
 		fprintf(stderr, "amixer: Unknown command '%s'...\n", argv[optind]);
+		retval = 0;
 	}
 
-	return 0;
+finish:
+	snd_config_update_free_global();
+
+	return retval;
 }

@@ -19,6 +19,8 @@
 #include "aconfig.h"
 #include <stdlib.h>
 #include <term.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
 #include "die.h"
 #include "widget.h"
 
@@ -26,10 +28,6 @@ int screen_lines;
 int screen_cols;
 
 static int cursor_visibility = -1;
-
-static void widget_handle_key(int key)
-{
-}
 
 static void update_cursor_visibility(void)
 {
@@ -85,9 +83,6 @@ void widget_init(struct widget *widget, int lines_, int cols, int y, int x,
 		set_panel_userptr(widget->panel, widget);
 	}
 
-	if (!widget->handle_key)
-		widget->handle_key = widget_handle_key;
-
 	if (old_window)
 		delwin(old_window);
 
@@ -127,6 +122,10 @@ void window_size_changed(void)
 {
 	PANEL *panel, *below;
 	const struct widget *widget;
+	struct winsize size;
+
+	if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &size) == 0)
+		resize_term(size.ws_row, size.ws_col);
 
 	getmaxyx(stdscr, screen_lines, screen_cols);
 	if (tigetflag("xenl") != 1 && tigetflag("am") != 1)

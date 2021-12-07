@@ -29,11 +29,13 @@
 #include <errno.h>
 #include <syslog.h>
 #include <sched.h>
-#include <alsa/asoundlib.h>
 #include "alsactl.h"
 
+#ifndef SYS_ASOUND_DIR
+#define SYS_ASOUND_DIR "/var/lib/alsa"
+#endif
 #ifndef SYS_ASOUNDRC
-#define SYS_ASOUNDRC "/var/lib/alsa/asound.state"
+#define SYS_ASOUNDRC SYS_ASOUND_DIR "/asound.state"
 #endif
 #ifndef SYS_PIDFILE
 #define SYS_PIDFILE "/var/run/alsactl.pid"
@@ -74,6 +76,7 @@ static struct arg args[] = {
 { 'v', "version", "print version of this program" },
 { HEADER, NULL, "Available state options:" },
 { FILEARG | 'f', "file", "configuration file (default " SYS_ASOUNDRC ")" },
+{ FILEARG | 'a', "config-dir", "boot / hotplug configuration directory (default " SYS_ASOUND_DIR ")" },
 { 'l', "lock", "use file locking to serialize concurrent access" },
 { 'L', "no-lock", "do not use file locking to serialize concurrent access" },
 { FILEARG | 'O', "lock-state-file", "state lock file path (default " SYS_LOCKFILE ")" },
@@ -96,6 +99,13 @@ static struct arg args[] = {
 { 's', "syslog", "use syslog for messages" },
 { INTARG | 'n', "nice", "set the process priority (see 'man nice')" },
 { 'c', "sched-idle", "set the process scheduling policy to idle (SCHED_IDLE)" },
+#ifdef HAVE_ALSA_USE_CASE_H
+{ 'D', "ucm-defaults", "execute also the UCM 'defaults' section" },
+{ 'U', "no-ucm", "don't init with UCM" },
+#if SND_LIB_VER(1, 2, 5) < SND_LIB_VERSION
+{ 'X', "ucm-nodev", "show UCM no device errors" },
+#endif
+#endif
 { HEADER, NULL, "Available commands:" },
 { CARDCMD, "store", "save current driver setup for one or each soundcards" },
 { EMPCMD, NULL, "  to configuration file" },
@@ -107,6 +117,9 @@ static struct arg args[] = {
 { CARDCMD, "rdaemon", "like daemon but do the state restore at first" },
 { KILLCMD, "kill", "notify daemon to quit, rescan or save_and_quit" },
 { CARDCMD, "monitor", "monitor control events" },
+{ CARDCMD, "clean", "clean application controls" },
+{ EMPCMD, "dump-state", "dump the state (for all cards)" },
+{ EMPCMD, "dump-cfg", "dump the configuration (expanded, for all cards)" },
 { 0, NULL, NULL }
 };
 
@@ -135,7 +148,7 @@ static void help(void)
 				strcat(buf, "<card>");
 			else if (sarg & KILLCMD)
 				strcat(buf, "<cmd>");
-			printf("  %-8s  %-6s  %s\n", larg ? larg : "",
+			printf("  %-10s  %-6s  %s\n", larg ? larg : "",
 							buf, a->comment);
 			continue;
 		}
@@ -150,6 +163,49 @@ static void help(void)
 	}
 }
 
+static int dump_config_tree(snd_config_t *top)
+{
+	snd_output_t *out;
+	int err;
+
+	err = snd_output_stdio_attach(&out, stdout, 0);
+	if (err < 0)
+		return err;
+	err = snd_config_save(top, out);
+	snd_output_close(out);
+	return err;
+}
+
+static int dump_state(const char *file)
+{
+	snd_config_t *top;
+	int err;
+
+	err = load_configuration(file, &top, NULL);
+	if (err < 0)
+		return err;
+	err = dump_config_tree(top);
+	snd_config_delete(top);
+	return err;
+}
+
+static int dump_configuration(void)
+{
+	snd_config_t *top, *cfg2;
+	int err;
+
+	err = snd_config_update_ref(&top);
+	if (err < 0)
+		return err;
+	/* expand cards.* tree */
+	err = snd_config_search_definition(top, "cards", "_dummy_", &cfg2);
+	if (err >= 0)
+		snd_config_delete(cfg2);
+	err = dump_config_tree(top);
+	snd_config_unref(top);
+	return err;
+}
+
 #define NO_NICE (-100000)
 
 static void do_nice(int use_nice, int sched_idle)
@@ -161,7 +217,7 @@ static void do_nice(int use_nice, int sched_idle)
 	if (sched_idle) {
 		if (sched_getparam(0, &sched_param) >= 0) {
 			sched_param.sched_priority = 0;
-			if (!sched_setscheduler(0, SCHED_RR, &sched_param))
+			if (sched_setscheduler(0, SCHED_IDLE, &sched_param) < 0)
 				error("sched_setparam failed: %s", strerror(errno));
 		} else {
 			error("sched_getparam failed: %s", strerror(errno));
@@ -178,11 +234,13 @@ int main(int argc, char *argv[])
 		"/dev/snd/hwC",
 		NULL
 	};
+	char *cfgdir = SYS_ASOUND_DIR;
 	char *cfgfile = SYS_ASOUNDRC;
 	char *initfile = DATADIR "/init/00main";
 	char *pidfile = SYS_PIDFILE;
 	char *cardname, ncardname[16];
 	char *cmd;
+	char *const *extra_args;
 	const char *const *tmp;
 	int removestate = 0;
 	int init_fallback = 1; /* new default behavior */
@@ -191,12 +249,16 @@ int main(int argc, char *argv[])
 	int daemoncmd = 0;
 	int use_nice = NO_NICE;
 	int sched_idle = 0;
+	int initflags = 0;
 	struct arg *a;
 	struct option *o;
 	int i, j, k, res;
 	struct option *long_option;
 	char *short_option;
 
+#if SND_LIB_VER(1, 2, 5) >= SND_LIB_VERSION
+	initflags |= FLAG_UCM_NODEV;
+#endif
 	long_option = calloc(ARRAY_SIZE(args), sizeof(struct option));
 	if (long_option == NULL)
 		exit(EXIT_FAILURE);
@@ -235,6 +297,9 @@ int main(int argc, char *argv[])
 		case 'f':
 			cfgfile = optarg;
 			break;
+		case 'a':
+			cfgdir = optarg;
+			break;
 		case 'l':
 			do_lock = 1;
 			break;
@@ -262,6 +327,15 @@ int main(int argc, char *argv[])
 			break;
 		case 'I':
 			init_fallback = 0;
+			break;
+		case 'D':
+			initflags |= FLAG_UCM_DEFAULTS;
+			break;
+		case 'U':
+			initflags |= FLAG_UCM_DISABLED;
+			break;
+		case 'X':
+			initflags |= FLAG_UCM_NODEV;
 			break;
 		case 'r':
 			statefile = optarg;
@@ -335,6 +409,8 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	extra_args = argc - optind > 2 ? argv + optind + 2 : NULL;
+
 	/* the global system file should be always locked */
 	if (strcmp(cfgfile, SYS_ASOUNDRC) == 0 && do_lock >= 0)
 		do_lock = 1;
@@ -342,7 +418,11 @@ int main(int argc, char *argv[])
 	/* when running in background, use syslog for reports */
 	if (background) {
 		use_syslog = 1;
-		daemon(0, 0);
+		if (daemon(0, 0)) {
+			syslog(LOG_INFO, "alsactl " SND_UTIL_VERSION_STR " daemon cannot be started: %s", strerror(errno));
+			res = EXIT_FAILURE;
+			goto out;
+		}
 	}
 
 	cmd = argv[optind];
@@ -354,8 +434,10 @@ int main(int argc, char *argv[])
 			syslog(LOG_INFO, "alsactl " SND_UTIL_VERSION_STR " daemon started");
 	}
 
+	snd_lib_error_set_handler(error_handler);
+
 	if (!strcmp(cmd, "init")) {
-		res = init(initfile, cardname);
+		res = init(cfgdir, initfile, initflags | FLAG_UCM_FBOOT | FLAG_UCM_BOOT, cardname);
 		snd_config_update_free_global();
 	} else if (!strcmp(cmd, "store")) {
 		res = save_state(cfgfile, cardname);
@@ -364,7 +446,7 @@ int main(int argc, char *argv[])
 		   !strcmp(cmd, "nrestore")) {
 		if (removestate)
 			remove(statefile);
-		res = load_state(cfgfile, initfile, cardname, init_fallback);
+		res = load_state(cfgdir, cfgfile, initfile, initflags, cardname, init_fallback);
 		if (!strcmp(cmd, "rdaemon")) {
 			do_nice(use_nice, sched_idle);
 			res = state_daemon(cfgfile, cardname, period, pidfile);
@@ -378,6 +460,12 @@ int main(int argc, char *argv[])
 		res = state_daemon_kill(pidfile, cardname);
 	} else if (!strcmp(cmd, "monitor")) {
 		res = monitor(cardname);
+	} else if (!strcmp(cmd, "clean")) {
+		res = clean(cardname, extra_args);
+	} else if (!strcmp(cmd, "dump-state")) {
+		res = dump_state(cfgfile);
+	} else if (!strcmp(cmd, "dump-cfg")) {
+		res = dump_configuration();
 	} else {
 		fprintf(stderr, "alsactl: Unknown command '%s'...\n", cmd);
 		res = -ENODEV;

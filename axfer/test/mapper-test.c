@@ -6,10 +6,19 @@
 //
 // Licensed under the terms of the GNU General Public License, version 2.
 
+#include <aconfig.h>
+#ifdef HAVE_MEMFD_CREATE
+#define _GNU_SOURCE
+#endif
+
 #include "../mapper.h"
 #include "../misc.h"
 
 #include "generator.h"
+
+#ifdef HAVE_MEMFD_CREATE
+#include <sys/mman.h>
+#endif
 
 #include <stdlib.h>
 #include <unistd.h>
@@ -63,10 +72,9 @@ static int test_demux(struct mapper_trial *trial, snd_pcm_access_t access,
 		      unsigned int frames_per_second,
 		      unsigned int frames_per_buffer,
 		      void *frame_buffer, unsigned int frame_count,
-		      unsigned int cntr_count)
+		      int *cntr_fds, unsigned int cntr_count)
 {
 	struct container_context *cntrs = trial->cntrs;
-	char **paths = trial->paths;
 	enum container_format cntr_format = trial->cntr_format;
 	unsigned int bytes_per_sample;
 	uint64_t total_frame_count;
@@ -78,8 +86,7 @@ static int test_demux(struct mapper_trial *trial, snd_pcm_access_t access,
 		unsigned int channels;
 		unsigned int rate;
 
-		err = container_builder_init(cntrs + i, paths[i], cntr_format,
-					     0);
+		err = container_builder_init(cntrs + i, cntr_fds[i], cntr_format, 0);
 		if (err < 0)
 			goto end;
 
@@ -156,10 +163,9 @@ static int test_mux(struct mapper_trial *trial, snd_pcm_access_t access,
 		    unsigned int frames_per_second,
 		    unsigned int frames_per_buffer,
 		    void *frame_buffer, unsigned int frame_count,
-		    unsigned int cntr_count)
+		    int *cntr_fds, unsigned int cntr_count)
 {
 	struct container_context *cntrs = trial->cntrs;
-	char **paths = trial->paths;
 	unsigned int bytes_per_sample;
 	uint64_t total_frame_count;
 	int i;
@@ -170,7 +176,7 @@ static int test_mux(struct mapper_trial *trial, snd_pcm_access_t access,
 		unsigned int channels;
 		unsigned int rate;
 
-		err = container_parser_init(cntrs + i, paths[i], 0);
+		err = container_parser_init(cntrs + i, cntr_fds[i], 0);
 		if (err < 0)
 			goto end;
 
@@ -218,6 +224,7 @@ static int test_mapper(struct mapper_trial *trial, snd_pcm_access_t access,
 		    void *check_buffer, unsigned int frame_count,
 		    unsigned int cntr_count)
 {
+	int *cntr_fds;
 	unsigned int frames_per_buffer;
 	int i;
 	int err;
@@ -225,18 +232,46 @@ static int test_mapper(struct mapper_trial *trial, snd_pcm_access_t access,
 	// Use a buffer aligned by typical size of page frame.
 	frames_per_buffer = ((frame_count + 4096) / 4096) * 4096;
 
+	cntr_fds = calloc(cntr_count, sizeof(*cntr_fds));
+	if (cntr_fds == NULL)
+		return -ENOMEM;
+
+	for (i = 0; i < cntr_count; ++i) {
+		const char *path = trial->paths[i];
+
+#ifdef HAVE_MEMFD_CREATE
+		cntr_fds[i] = memfd_create(path, 0);
+#else
+		cntr_fds[i] = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+#endif
+		if (cntr_fds[i] < 0) {
+			err = -errno;
+			goto end;
+		}
+	}
+
 	err = test_demux(trial, access, sample_format, samples_per_frame,
 			 frames_per_second, frames_per_buffer, frame_buffer,
-			 frame_count, cntr_count);
+			 frame_count, cntr_fds, cntr_count);
 	if (err < 0)
 		goto end;
 
+	for (i = 0; i < cntr_count; ++i) {
+		off64_t pos = lseek64(cntr_fds[i], 0, SEEK_SET);
+		if (pos != 0) {
+			err = -EIO;
+			goto end;
+		}
+	}
+
 	err = test_mux(trial, access, sample_format, samples_per_frame,
 		       frames_per_second, frames_per_buffer, check_buffer,
-		       frame_count, cntr_count);
+		       frame_count, cntr_fds, cntr_count);
 end:
 	for (i = 0; i < cntr_count; ++i)
-		unlink(trial->paths[i]);
+		close(cntr_fds[i]);
+
+	free(cntr_fds);
 
 	return err;
 }
@@ -396,13 +431,13 @@ int main(int argc, const char *argv[])
 {
 	// Test 8/16/18/20/24/32/64 bytes per sample.
 	static const uint64_t sample_format_mask =
-			(1ul << SND_PCM_FORMAT_U8) |
-			(1ul << SND_PCM_FORMAT_S16_LE) |
-			(1ul << SND_PCM_FORMAT_S18_3LE) |
-			(1ul << SND_PCM_FORMAT_S20_3LE) |
-			(1ul << SND_PCM_FORMAT_S24_LE) |
-			(1ul << SND_PCM_FORMAT_S32_LE) |
-			(1ul << SND_PCM_FORMAT_FLOAT64_LE);
+			(1ull << SND_PCM_FORMAT_U8) |
+			(1ull << SND_PCM_FORMAT_S16_LE) |
+			(1ull << SND_PCM_FORMAT_S18_3LE) |
+			(1ull << SND_PCM_FORMAT_S20_3LE) |
+			(1ull << SND_PCM_FORMAT_S24_LE) |
+			(1ull << SND_PCM_FORMAT_S32_LE) |
+			(1ull << SND_PCM_FORMAT_FLOAT64_LE);
 	uint64_t access_mask;
 	struct test_generator gen = {0};
 	struct mapper_trial *trial;
@@ -451,13 +486,13 @@ int main(int argc, const char *argv[])
 			goto end;
 		}
 
-		access_mask = 1ul << access;
+		access_mask = 1ull << access;
 		verbose = true;
 	} else {
-		access_mask = (1ul << SND_PCM_ACCESS_MMAP_INTERLEAVED) |
-			      (1ul << SND_PCM_ACCESS_MMAP_NONINTERLEAVED) |
-			      (1ul << SND_PCM_ACCESS_RW_INTERLEAVED) |
-			      (1ul << SND_PCM_ACCESS_RW_NONINTERLEAVED);
+		access_mask = (1ull << SND_PCM_ACCESS_MMAP_INTERLEAVED) |
+			      (1ull << SND_PCM_ACCESS_MMAP_NONINTERLEAVED) |
+			      (1ull << SND_PCM_ACCESS_RW_INTERLEAVED) |
+			      (1ull << SND_PCM_ACCESS_RW_NONINTERLEAVED);
 		verbose = false;
 	}
 

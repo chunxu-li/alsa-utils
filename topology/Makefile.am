@@ -8,12 +8,15 @@ endif
 %.1: %.rst
 	rst2man $< > $@
 
-alsatplg_SOURCES = topology.c
+alsatplg_SOURCES = topology.c pre-processor.c pre-process-class.c pre-process-object.c \
+		    pre-process-dapm.c pre-process-dai.c
+
+noinst_HEADERS = topology.h pre-processor.h
 
 AM_CPPFLAGS = \
          -Wall -I$(top_srcdir)/include
 
-alsatplg_LDADD = -lasound
+alsatplg_LDADD = $(ALSA_TOPOLOGY_LIBS)
 
 EXTRA_DIST = alsatplg.rst
 

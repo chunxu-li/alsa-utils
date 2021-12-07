@@ -37,7 +37,6 @@
 #include <sys/types.h>
 #include <dirent.h>
 #include <math.h>
-#include <alsa/asoundlib.h>
 #include "aconfig.h"
 #include "alsactl.h"
 #include "list.h"
@@ -187,7 +186,7 @@ static int init_space(struct space **space, int card)
 		return -ENOMEM;
 	res->ctl_id_changed = ~0;
 	res->linenum = -1;
-	sprintf(device, "hw:%u", card);
+	sprintf(device, "hw:%d", card);
 	err = snd_hctl_open(&res->ctl_handle, device, 0);
 	if (err < 0)
 		goto error;
@@ -465,12 +464,13 @@ static int set_ctl_value(struct space *space, const char *value, int all)
 			return -EINVAL;
 		}
 		for (idx = 0; idx < count; idx += 2) {
-			val = hextodigit(*(value++)) << 4;
-			val |= hextodigit(*(value++));
-			if (val > 255) {
+			int nibble1 = hextodigit(*(value++));
+			int nibble2 = hextodigit(*(value++));
+			if (nibble1 < 0 || nibble2 < 0) {
 				Perror(space, "bad ctl hexa value");
 				return -EINVAL;
 			}
+			val = (nibble1 << 4) | nibble2;
 			snd_ctl_elem_value_set_byte(space->ctl_value, idx, val);
 		}
 		break;
@@ -734,7 +734,7 @@ dbvalue:
 			elem = snd_hctl_elem_next(elem);
 		}
 		snd_ctl_elem_id_free(id);
-		sprintf(res, "%u", index);
+		sprintf(res, "%d", index);
 		dbg("do_ctl_count found %s controls", res);
 		return res;
 	}
@@ -1700,6 +1700,7 @@ static int parse(struct space *space, const char *filename)
 		
 		if (count > linesize - 1) {
 			free(line);
+			line = NULL;
 			linesize = (count + 127 + 1) & ~127;
 			if (linesize > 2048) {
 				error("file %s, line %i too long", filename, linenum);
@@ -1742,52 +1743,44 @@ static int parse(struct space *space, const char *filename)
 	return err ? err : -abs(space->exit_code);
 }
 
-int init(const char *filename, const char *cardname)
+int init(const char *cfgdir, const char *filename, int flags, const char *cardname)
 {
 	struct space *space;
-	int err = 0, card, first;
+	struct snd_card_iterator iter;
+	int err = 0, lasterr = 0;
 	
 	sysfs_init();
-	if (!cardname) {
-		first = 1;
-		card = -1;
-		while (1) {
-			if (snd_card_next(&card) < 0)
-				break;
-			if (card < 0) {
-				if (first) {
-					error("No soundcards found...");
-					return -ENODEV;
-				}
-				break;
+	err = snd_card_iterator_sinit(&iter, cardname);
+	if (err < 0)
+		goto out;
+	while (snd_card_iterator_next(&iter)) {
+		err = snd_card_clean_cfgdir(cfgdir, iter.card);
+		if (err < 0) {
+			if (lasterr == 0)
+				lasterr = err;
+			continue;
+		}
+		err = init_ucm(flags, iter.card);
+		if (err == 0)
+			continue;
+		err = init_space(&space, iter.card);
+		if (err != 0)
+			continue;
+		space->rootdir = new_root_dir(filename);
+		if (space->rootdir != NULL) {
+			err = parse(space, filename);
+			if (!cardname && err <= -99) { /* non-fatal errors */
+				if (lasterr == 0)
+					lasterr = err;
+				err = 0;
 			}
-			first = 0;
-			err = init_space(&space, card);
-			if (err == 0) {
-				space->rootdir = new_root_dir(filename);
-				if (space->rootdir != NULL)
-					err = parse(space, filename);
-				free_space(space);
-			}
-			if (err < 0)
-				break;
 		}
-	} else {
-		card = snd_card_get_index(cardname);
-		if (card < 0) {
-			error("Cannot find soundcard '%s'...", cardname);
-			goto error;
-		}
-		memset(&space, 0, sizeof(space));
-		err = init_space(&space, card);
-		if (err == 0) {
-			space->rootdir = new_root_dir(filename);
-			if (space->rootdir  != NULL)
-				err = parse(space, filename);
-			free_space(space);
-		}
+		free_space(space);
+		if (err < 0)
+			goto out;
 	}
-  error:
+	err = lasterr ? lasterr : snd_card_iterator_error(&iter);
+out:
 	sysfs_cleanup();
 	return err;
 }

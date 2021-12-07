@@ -25,7 +25,7 @@
 #include <string.h>
 #include <signal.h>
 #include <getopt.h>
-#include <sys/poll.h>
+#include <poll.h>
 #include <alsa/asoundlib.h>
 #include "aconfig.h"
 #include "version.h"
@@ -357,7 +357,7 @@ int main(int argc, char *argv[])
 		{"version", 0, NULL, 'V'},
 		{"list", 0, NULL, 'l'},
 		{"port", 1, NULL, 'p'},
-		{ }
+		{0}
 	};
 
 	int do_list = 0;

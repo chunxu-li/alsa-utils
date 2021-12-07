@@ -100,8 +100,8 @@ static void *get_buffer(struct libasound_state *state,
 
 	if (layout->vector == NULL) {
 		char *buf;
-		buf = areas[0].addr + snd_pcm_frames_to_bytes(state->handle,
-							      frame_offset);
+		buf = areas[0].addr;
+		buf += snd_pcm_frames_to_bytes(state->handle, frame_offset);
 		frame_buf = buf;
 	} else {
 		int i;
@@ -171,7 +171,8 @@ static int timer_mmap_process_frames(struct libasound_state *state,
 		// exactly the mechanism yet.
 		err = xfer_libasound_wait_event(state, timeout_msec,
 						&revents);
-		if (err < 0)
+		// MEMO: timeout is expected since the above call is just to measure time elapse.
+		if (err < 0 && err != -ETIMEDOUT)
 			return err;
 		if (revents & POLLERR) {
 			// TODO: error reporting.

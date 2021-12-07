@@ -77,7 +77,7 @@ static int select_wait_event(struct waiter_context *waiter, int timeout_msec)
 	err = select(fd_max + 1, &state->rfds_rd, &state->rfds_wr,
 		     &state->rfds_ex, tv_ptr);
 	if (err < 0)
-		return err;
+		return -errno;
 
 	for (i = 0; i < waiter->pfd_count; ++i) {
 		pfd = &waiter->pfds[i];
@@ -91,7 +91,7 @@ static int select_wait_event(struct waiter_context *waiter, int timeout_msec)
 			pfd->revents |= POLLHUP;
 	}
 
-	return 0;
+	return err;
 }
 
 static void select_release(struct waiter_context *waiter)

@@ -120,7 +120,7 @@ static int setparams_stream(struct loopback_handle *lhandle,
 	}
 	err = snd_pcm_hw_params_set_rate_resample(handle, params, lhandle->resample);
 	if (err < 0) {
-		logit(LOG_CRIT, "Resample setup failed for %s (val %i): %s\n", lhandle->id, lhandle->resample, snd_strerror(err));
+		logit(LOG_CRIT, "Resample setup failed for %s (val %u): %s\n", lhandle->id, lhandle->resample, snd_strerror(err));
 		return err;
 	}
 	err = snd_pcm_hw_params_set_access(handle, params, lhandle->access);
@@ -135,13 +135,13 @@ static int setparams_stream(struct loopback_handle *lhandle,
 	}
 	err = snd_pcm_hw_params_set_channels(handle, params, lhandle->channels);
 	if (err < 0) {
-		logit(LOG_CRIT, "Channels count (%i) not available for %s: %s\n", lhandle->channels, lhandle->id, snd_strerror(err));
+		logit(LOG_CRIT, "Channels count (%u) not available for %s: %s\n", lhandle->channels, lhandle->id, snd_strerror(err));
 		return err;
 	}
 	rrate = lhandle->rate_req;
 	err = snd_pcm_hw_params_set_rate_near(handle, params, &rrate, 0);
 	if (err < 0) {
-		logit(LOG_CRIT, "Rate %iHz not available for %s: %s\n", lhandle->rate_req, lhandle->id, snd_strerror(err));
+		logit(LOG_CRIT, "Rate %uHz not available for %s: %s\n", lhandle->rate_req, lhandle->id, snd_strerror(err));
 		return err;
 	}
 	rrate = 0;
@@ -152,7 +152,7 @@ static int setparams_stream(struct loopback_handle *lhandle,
 	    !lhandle->loopback->src_enable &&
 #endif
 	    (int)rrate != lhandle->rate) {
-		logit(LOG_CRIT, "Rate does not match (requested %iHz, got %iHz, resample %i)\n", lhandle->rate, rrate, lhandle->resample);
+		logit(LOG_CRIT, "Rate does not match (requested %uHz, got %uHz, resample %u)\n", lhandle->rate, rrate, lhandle->resample);
 		return -EINVAL;
 	}
 	lhandle->pitch = (double)lhandle->rate_req / (double)lhandle->rate;
@@ -556,13 +556,13 @@ static void buf_add_src(struct loopback *loop)
 		if (capt->format == SND_PCM_FORMAT_S32)
 			src_int_to_float_array((int *)(capt->buf +
 						pos1 * capt->frame_size),
-					 (void *)loop->src_data.data_in +
+					 (float *)loop->src_data.data_in +
 					   pos * capt->channels,
 					 count1 * capt->channels);
 		else
 			src_short_to_float_array((short *)(capt->buf +
 						pos1 * capt->frame_size),
-					 (void *)loop->src_data.data_in +
+					 (float *)loop->src_data.data_in +
 					   pos * capt->channels,
 					 count1 * capt->channels);
 		count -= count1;
@@ -969,13 +969,14 @@ static int xrun_sync(struct loopback *loop)
 					"sync: playback silence added %li samples\n", (long)diff);
 			play->buf_pos -= diff;
 			play->buf_pos %= play->buf_size;
-			if ((err = snd_pcm_format_set_silence(play->format, play->buf + play->buf_pos * play->channels, diff)) < 0)
+			err =  snd_pcm_format_set_silence(play->format, play->buf + play->buf_pos * play->frame_size,
+							  diff * play->channels);
+			if (err < 0)
 				return err;
 			play->buf_count += diff;
 		}
 		if ((err = snd_pcm_prepare(play->handle)) < 0) {
 			logit(LOG_CRIT, "%s prepare failed: %s\n", play->id, snd_strerror(err));
-
 			return err;
 		}
 		delay1 = writeit(play);
@@ -1001,7 +1002,9 @@ static int xrun_sync(struct loopback *loop)
 					"sync: playback short, silence filling %li / buf_count=%li\n", (long)delay1, play->buf_count);
 			if (delay1 > diff)
 				delay1 = diff;
-			if ((err = snd_pcm_format_set_silence(play->format, play->buf + play->buf_pos * play->channels, delay1)) < 0)
+			err = snd_pcm_format_set_silence(play->format, play->buf + play->buf_pos * play->frame_size,
+							 delay1 * play->channels);
+			if (err < 0)
 				return err;
 			play->buf_pos += delay1;
 			play->buf_pos %= play->buf_size;
@@ -1057,10 +1060,16 @@ static int set_rate_shift(struct loopback_handle *lhandle, double pitch)
 {
 	int err;
 
-	if (lhandle->ctl_rate_shift == NULL)
+	if (lhandle->ctl_rate_shift) {
+		snd_ctl_elem_value_set_integer(lhandle->ctl_rate_shift, 0, pitch * 100000);
+		err = snd_ctl_elem_write(lhandle->ctl, lhandle->ctl_rate_shift);
+	} else if (lhandle->ctl_pitch) {
+		// 'Playback/Capture Pitch 1000000' requires reciprocal to pitch
+		snd_ctl_elem_value_set_integer(lhandle->ctl_pitch, 0, (1 / pitch) * 1000000);
+		err = snd_ctl_elem_write(lhandle->ctl, lhandle->ctl_pitch);
+	} else {
 		return 0;
-	snd_ctl_elem_value_set_integer(lhandle->ctl_rate_shift, 0, pitch * 100000);
-	err = snd_ctl_elem_write(lhandle->ctl, lhandle->ctl_rate_shift);
+	}
 	if (err < 0) {
 		logit(LOG_CRIT, "Cannot set PCM Rate Shift element for %s: %s\n", lhandle->id, snd_strerror(err));
 		return err;
@@ -1093,7 +1102,8 @@ void update_pitch(struct loopback *loop)
 #endif
 	}
 	else if (loop->sync == SYNC_TYPE_PLAYRATESHIFT) {
-		set_rate_shift(loop->play, pitch);
+		// pitch is capture-based, playback side requires reciprocal
+		set_rate_shift(loop->play, 1 / pitch);
 #ifdef USE_SAMPLERATE
 		if (loop->use_samplerate) {
 			loop->src_data.src_ratio = 
@@ -1164,27 +1174,57 @@ static int get_channels(struct loopback_handle *lhandle)
 	return snd_ctl_elem_value_get_integer(lhandle->ctl_channels, 0);
 }
 
-static void openctl_elem(struct loopback_handle *lhandle,
-			 int device, int subdevice,
-			 const char *name,
-			 snd_ctl_elem_value_t **elem)
+static int openctl_elem_id(struct loopback_handle *lhandle, snd_ctl_elem_id_t *id,
+		snd_ctl_elem_value_t **elem)
 {
 	int err;
 
 	if (snd_ctl_elem_value_malloc(elem) < 0) {
 		*elem = NULL;
-	} else {
-		snd_ctl_elem_value_set_interface(*elem,
-						 SND_CTL_ELEM_IFACE_PCM);
-		snd_ctl_elem_value_set_device(*elem, device);
-		snd_ctl_elem_value_set_subdevice(*elem, subdevice);
-		snd_ctl_elem_value_set_name(*elem, name);
-		err = snd_ctl_elem_read(lhandle->ctl, *elem);
-		if (err < 0) {
-			snd_ctl_elem_value_free(*elem);
-			*elem = NULL;
-		}
+		return -ENOMEM;
 	}
+	snd_ctl_elem_value_set_id(*elem, id);
+	snd_ctl_elem_value_set_interface(*elem, SND_CTL_ELEM_IFACE_PCM);
+	err = snd_ctl_elem_read(lhandle->ctl, *elem);
+	if (err < 0) {
+		snd_ctl_elem_value_free(*elem);
+		*elem = NULL;
+		return err;
+	} else {
+		snd_output_printf(lhandle->loopback->output,
+				"Opened PCM element %s of %s, device %d, subdevice %d\n",
+				snd_ctl_elem_id_get_name(id), snd_ctl_name(lhandle->ctl),
+				snd_ctl_elem_id_get_device(id),
+				snd_ctl_elem_id_get_subdevice(id));
+		return 0;
+	}
+}
+
+static int openctl_elem(struct loopback_handle *lhandle,
+			 int device, int subdevice,
+			 const char *name,
+			 snd_ctl_elem_value_t **elem)
+{
+	snd_ctl_elem_id_t *id;
+
+	snd_ctl_elem_id_alloca(&id);
+	snd_ctl_elem_id_set_device(id, device);
+	snd_ctl_elem_id_set_subdevice(id, subdevice);
+	snd_ctl_elem_id_set_name(id, name);
+	return openctl_elem_id(lhandle, id, elem);
+}
+
+static int openctl_elem_ascii(struct loopback_handle *lhandle, char *ascii_name,
+		snd_ctl_elem_value_t **elem)
+{
+	snd_ctl_elem_id_t *id;
+
+	snd_ctl_elem_id_alloca(&id);
+	if (snd_ctl_ascii_elem_id_parse(id, ascii_name)) {
+		fprintf(stderr, "Wrong control identifier: %s\n", ascii_name);
+		return -EINVAL;
+	}
+	return openctl_elem_id(lhandle, id, elem);
 }
 
 static int openctl(struct loopback_handle *lhandle, int device, int subdevice)
@@ -1193,14 +1233,30 @@ static int openctl(struct loopback_handle *lhandle, int device, int subdevice)
 
 	lhandle->ctl_rate_shift = NULL;
 	if (lhandle->loopback->play == lhandle) {
+		// play only
+		if (lhandle->prateshift_name) {
+			err = openctl_elem_ascii(lhandle, lhandle->prateshift_name,
+					&lhandle->ctl_rate_shift);
+			if (err < 0) {
+				logit(LOG_CRIT, "Unable to open playback PCM Rate Shift elem '%s'.\n",
+						lhandle->prateshift_name);
+				exit(EXIT_FAILURE);
+			}
+		} else
+			openctl_elem(lhandle, device, subdevice, "Playback Pitch 1000000",
+					&lhandle->ctl_pitch);
+		set_rate_shift(lhandle, 1);
 		if (lhandle->loopback->controls)
 			goto __events;
 		return 0;
 	}
+	// capture only
 	openctl_elem(lhandle, device, subdevice, "PCM Notify",
 			&lhandle->ctl_notify);
 	openctl_elem(lhandle, device, subdevice, "PCM Rate Shift 100000",
 			&lhandle->ctl_rate_shift);
+	openctl_elem(lhandle, device, subdevice, "Capture Pitch 1000000",
+			&lhandle->ctl_pitch);
 	set_rate_shift(lhandle, 1);
 	openctl_elem(lhandle, device, subdevice, "PCM Slave Active",
 			&lhandle->ctl_active);
@@ -1286,6 +1342,9 @@ static int closeit(struct loopback_handle *lhandle)
 	if (lhandle->ctl_rate_shift)
 		snd_ctl_elem_value_free(lhandle->ctl_rate_shift);
 	lhandle->ctl_rate_shift = NULL;
+	if (lhandle->ctl_pitch)
+		snd_ctl_elem_value_free(lhandle->ctl_pitch);
+	lhandle->ctl_pitch = NULL;
 	if (lhandle->ctl)
 		err = snd_ctl_close(lhandle->ctl);
 	lhandle->ctl = NULL;
@@ -1331,9 +1390,9 @@ int pcmjob_init(struct loopback *loop)
 	snprintf(id, sizeof(id), "%s/%s", loop->play->id, loop->capt->id);
 	id[sizeof(id)-1] = '\0';
 	loop->id = strdup(id);
-	if (loop->sync == SYNC_TYPE_AUTO && loop->capt->ctl_rate_shift)
+	if (loop->sync == SYNC_TYPE_AUTO && (loop->capt->ctl_rate_shift || loop->capt->ctl_pitch))
 		loop->sync = SYNC_TYPE_CAPTRATESHIFT;
-	if (loop->sync == SYNC_TYPE_AUTO && loop->play->ctl_rate_shift)
+	if (loop->sync == SYNC_TYPE_AUTO && (loop->play->ctl_rate_shift || loop->play->ctl_pitch))
 		loop->sync = SYNC_TYPE_PLAYRATESHIFT;
 #ifdef USE_SAMPLERATE
 	if (loop->sync == SYNC_TYPE_AUTO && loop->src_enable)
@@ -1613,7 +1672,7 @@ __again:
 	if (count > loop->play->buffer_size)
 		count = loop->play->buffer_size;
 	if (err != count) {
-		logit(LOG_CRIT, "%s: initial playback fill error (%i/%i/%i)\n", loop->id, err, (int)count, loop->play->buffer_size);
+		logit(LOG_CRIT, "%s: initial playback fill error (%i/%i/%u)\n", loop->id, err, (int)count, loop->play->buffer_size);
 		err = -EIO;
 		goto __error;
 	}
@@ -1695,9 +1754,8 @@ int pcmjob_pollfds_init(struct loopback *loop, struct pollfd *fds)
 static snd_pcm_sframes_t get_queued_playback_samples(struct loopback *loop)
 {
 	snd_pcm_sframes_t delay;
-	int err;
 
-	if ((err = snd_pcm_delay(loop->play->handle, &delay)) < 0)
+	if (snd_pcm_delay(loop->play->handle, &delay) < 0)
 		return 0;
 	loop->play->last_delay = delay;
 	delay += loop->play->buf_count;
@@ -1951,8 +2009,16 @@ int pcmjob_pollfds_handle(struct loopback *loop, struct pollfd *fds)
 	}
 	if (loop->sync != SYNC_TYPE_NONE) {
 		snd_pcm_sframes_t pqueued, cqueued;
-		pqueued = get_queued_playback_samples(loop);
-		cqueued = get_queued_capture_samples(loop);
+
+		/* Reduce cumulative error by interleaving playback vs capture reading order */
+		if (loop->total_queued_count & 1) {
+			pqueued = get_queued_playback_samples(loop);
+			cqueued = get_queued_capture_samples(loop);
+		} else {
+			cqueued = get_queued_capture_samples(loop);
+			pqueued = get_queued_playback_samples(loop);
+		}
+
 		if (verbose > 4)
 			snd_output_printf(loop->output, "%s: queued %li/%li samples\n", loop->id, pqueued, cqueued);
 		if (pqueued > 0)

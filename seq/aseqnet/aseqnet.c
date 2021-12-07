@@ -21,6 +21,7 @@
 #include <string.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <arpa/inet.h>
 #include <netdb.h>
 #include <locale.h>
 #include <alsa/asoundlib.h>
@@ -37,11 +38,10 @@ static void usage(void);
 static void init_buf(void);
 static void init_pollfds(void);
 static void close_files(void);
-static void init_seq(char *source, char *dest);
-static int get_port(char *service);
+static void init_seq(char *source, char *dest, char *name);
 static void sigterm_exit(int sig);
-static void init_server(int port);
-static void init_client(char *server, int port);
+static void init_server(const char *port);
+static void init_client(const char *server, const char *port);
 static void do_loop(void);
 static int copy_local_to_remote(void);
 static int copy_remote_to_local(int fd);
@@ -49,7 +49,7 @@ static int copy_remote_to_local(int fd);
 /*
  * default TCP port number
  */
-#define DEFAULT_PORT	40002
+#define DEFAULT_PORT	"40002"
 
 /*
  * local input buffer
@@ -75,6 +75,7 @@ static int cur_connected;
 static int seq_port;
 
 static int server_mode;
+static int ipv6 = 0;
 static int verbose = 0;
 static int info = 0;
 
@@ -84,9 +85,11 @@ static int info = 0;
  */
 
 static const struct option long_option[] = {
+	{"ipv6", 0, NULL, '6'},
 	{"port", 1, NULL, 'p'},
 	{"source", 1, NULL, 's'},
 	{"dest", 1, NULL, 'd'},
+	{"name", 1, NULL, 'n'},
 	{"help", 0, NULL, 'h'},
 	{"verbose", 0, NULL, 'v'},
 	{"info", 0, NULL, 'i'},
@@ -96,27 +99,31 @@ static const struct option long_option[] = {
 int main(int argc, char **argv)
 {
 	int c;
-	int port = DEFAULT_PORT;
+	char *port = DEFAULT_PORT;
 	char *source = NULL, *dest = NULL;
+	char *name = NULL;
 
 #ifdef ENABLE_NLS
 	setlocale(LC_ALL, "");
 	textdomain(PACKAGE);
 #endif
 
-	while ((c = getopt_long(argc, argv, "p:s:d:vi", long_option, NULL)) != -1) {
+	while ((c = getopt_long(argc, argv, "p:s:d:n:6hvi", long_option, NULL)) != -1) {
 		switch (c) {
+		case '6':
+			ipv6 = 1;
+			break;
 		case 'p':
-			if (isdigit(*optarg))
-				port = atoi(optarg);
-			else
-				port = get_port(optarg);
+			port = optarg;
 			break;
 		case 's':
 			source = optarg;
 			break;
 		case 'd':
 			dest = optarg;
+			break;
+		case 'n':
+			name = optarg;
 			break;
 		case 'v':
 			verbose++;
@@ -134,7 +141,7 @@ int main(int argc, char **argv)
 	signal(SIGTERM, sigterm_exit);
 
 	init_buf();
-	init_seq(source, dest);
+	init_seq(source, dest, name);
 
 	if (optind >= argc) {
 		server_mode = 1;
@@ -167,9 +174,11 @@ static void usage(void)
 	printf(_("  server mode: aseqnet [-options]\n"));
 	printf(_("  client mode: aseqnet [-options] server_host\n"));
 	printf(_("options:\n"));
+	printf(_("  -6,--ipv6 : use IPv6 TCP protocol\n"));
 	printf(_("  -p,--port # : specify TCP port (digit or service name)\n"));
 	printf(_("  -s,--source addr : read from given addr (client:port)\n"));
 	printf(_("  -d,--dest addr : write to given addr (client:port)\n"));
+	printf(_("  -n,--name value : use a specific midi process name\n"));
 	printf(_("  -v, --verbose : print verbose messages\n"));
 	printf(_("  -i, --info : print certain received events\n"));
 }
@@ -223,7 +232,7 @@ static void close_files(void)
 /*
  * initialize sequencer
  */
-static void init_seq(char *source, char *dest)
+static void init_seq(char *source, char *dest, char* name)
 {
 	snd_seq_addr_t addr;
 	int err, counti, counto;
@@ -252,10 +261,14 @@ static void init_seq(char *source, char *dest)
 	snd_seq_nonblock(handle, 1);
 
 	/* set client info */
-	if (server_mode)
-		snd_seq_set_client_name(handle, "Net Server");
-	else
-		snd_seq_set_client_name(handle, "Net Client");
+	if (name)
+		snd_seq_set_client_name(handle, name);
+	else {
+		if (server_mode)
+			snd_seq_set_client_name(handle, "Net Server");
+		else
+			snd_seq_set_client_name(handle, "Net Client");
+	}
 
 	/* create a port */
 	seq_port = snd_seq_create_simple_port(handle, "Network",
@@ -297,19 +310,25 @@ static void init_seq(char *source, char *dest)
 	}
 }
 
-
 /*
- * convert from string to TCP port number
+ * translate the binary network address to ASCII
  */
-static int get_port(char *service)
+static void get_net_addr(struct addrinfo *rp, char *buf, size_t buflen)
 {
-	struct servent *sp;
+	void *ptr;
 
-	if ((sp = getservbyname(service, "tcp")) == NULL){
-		fprintf(stderr, _("service '%s' is not found in /etc/services\n"), service);
-		return -1;
+	switch (rp->ai_family) {
+	case AF_INET:
+		ptr = &((struct sockaddr_in *) rp->ai_addr)->sin_addr;
+		break;
+	case AF_INET6:
+		ptr = &((struct sockaddr_in6 *) rp->ai_addr)->sin6_addr;
+		break;
+	default:
+		ptr = NULL;
 	}
-	return sp->s_port;
+	buf[buflen-1] = '\0';
+	inet_ntop(rp->ai_family, ptr, buf, buflen-1);
 }
 
 /*
@@ -325,30 +344,48 @@ static void sigterm_exit(int sig)
 /*
  * initialize network server
  */
-static void init_server(int port)
+static void init_server(const char *port)
 {
+	struct addrinfo hints;
+	struct addrinfo *result, *rp;
+	char buf[100];
 	int i;
 	int curstate = 1;
-	struct sockaddr_in addr;
+	int save_errno = 0;
 
-	memset(&addr, 0, sizeof(addr));
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = ipv6 ? AF_INET6 : AF_INET;
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_flags = AI_PASSIVE;
 
-	addr.sin_family = AF_INET;
-	addr.sin_addr.s_addr = INADDR_ANY;
-	addr.sin_port = htons(port);
-
-	sockfd = socket(AF_INET, SOCK_STREAM, 0);
-	if (sockfd < 0)  {
-		perror("create socket");
+	if (getaddrinfo(NULL, port, &hints, &result) < 0) {
+		fprintf(stderr, _("can't get address\n"));
 		exit(1);
 	}
-	setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &curstate, sizeof(curstate));
-	/* the return value is ignored.. */
-
-	if (bind(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0)  {
-		perror("can't bind");
+	for (rp = result; rp != NULL; rp = rp->ai_next) {
+		if ((sockfd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol)) < 0){
+			perror("create socket");
+			exit(1);
+		}
+		if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &curstate, sizeof(curstate)) < 0) {
+			perror("setsockopt");
+			exit(1);
+		}
+		if (verbose) {
+			get_net_addr(rp, buf, sizeof(buf));
+			fprintf(stderr, _("connecting to: %s\n"), buf);
+		}
+		if (bind(sockfd, rp->ai_addr, rp->ai_addrlen) == 0)
+			break;
+		save_errno = errno;
+		close(sockfd);
+	}
+	if (rp == NULL) {
+		errno = save_errno;
+		perror("bind");
 		exit(1);
 	}
+	freeaddrinfo(result);
 
 	if (listen(sockfd, 5) < 0)  {
 		perror("can't listen");
@@ -392,32 +429,48 @@ static void start_connection(void)
 /*
  * initialize network client
  */
-static void init_client(char *server, int port)
+static void init_client(const char *server, const char *port)
 {
-	struct sockaddr_in addr;
-	struct hostent *host;
+	struct addrinfo hints;
+	struct addrinfo *result, *rp;
+	char buf[100];
 	int curstate = 1;
 	int fd;
+	int save_errno = 0;
 
-	if ((fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) < 0){
-		perror("create socket");
-		exit(1);
-	}
-	if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &curstate, sizeof(curstate)) < 0) {
-		perror("setsockopt");
-		exit(1);
-	}
-	if ((host = gethostbyname(server)) == NULL){
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_flags = AI_PASSIVE;
+
+	if (getaddrinfo(server, port, &hints, &result) < 0) {
 		fprintf(stderr, _("can't get address %s\n"), server);
 		exit(1);
 	}
-	addr.sin_port = htons(port);
-	addr.sin_family = AF_INET;
-	memcpy(&addr.sin_addr, host->h_addr, host->h_length);
-	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+	for (rp = result; rp != NULL; rp = rp->ai_next) {
+		if ((fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol)) < 0){
+			perror("create socket");
+			exit(1);
+		}
+		if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &curstate, sizeof(curstate)) < 0) {
+			perror("setsockopt");
+			exit(1);
+		}
+		if (verbose) {
+			get_net_addr(rp, buf, sizeof(buf));
+			fprintf(stderr, _("connecting to: %s\n"), buf);
+		}
+		if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0)
+			break;
+		save_errno = errno;
+		close(fd);
+	}
+	if (rp == NULL) {
+		errno = save_errno;
 		perror("connect");
 		exit(1);
 	}
+	freeaddrinfo(result);
 	if (verbose)
 		fprintf(stderr, _("ok.. connected\n"));
 	netfd[0] = fd;
@@ -491,8 +544,11 @@ static void flush_writebuf(void)
 	if (cur_wrlen) {
 		int i;
 		for (i = 0; i < max_connection; i++) {
-			if (netfd[i] >= 0)
-				write(netfd[i], writebuf, cur_wrlen);
+			if (netfd[i] >= 0) {
+				ssize_t wrlen = write(netfd[i], writebuf, cur_wrlen);
+				if (wrlen != (ssize_t)cur_wrlen)
+					fprintf(stderr, "write error: %s", wrlen < 0 ? strerror(errno) : "short");
+			}
 		}
 		cur_wrlen = 0;
 	}

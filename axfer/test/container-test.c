@@ -6,10 +6,19 @@
 //
 // Licensed under the terms of the GNU General Public License, version 2.
 
+#include <aconfig.h>
+#ifdef HAVE_MEMFD_CREATE
+#define _GNU_SOURCE
+#endif
+
 #include "../container.h"
 #include "../misc.h"
 
 #include "generator.h"
+
+#ifdef HAVE_MEMFD_CREATE
+#include <sys/mman.h>
+#endif
 
 #include <stdlib.h>
 #include <unistd.h>
@@ -24,8 +33,8 @@ struct container_trial {
 	bool verbose;
 };
 
-static void test_builder(struct container_context *cntr,
-			 enum container_format format, const char *const name,
+static void test_builder(struct container_context *cntr, int fd,
+			 enum container_format format,
 			 snd_pcm_access_t access,
 			 snd_pcm_format_t sample_format,
 			 unsigned int samples_per_frame,
@@ -41,7 +50,7 @@ static void test_builder(struct container_context *cntr,
 	uint64_t total_frame_count;
 	int err;
 
-	err = container_builder_init(cntr, name, format, verbose);
+	err = container_builder_init(cntr, fd, format, verbose);
 	assert(err == 0);
 
 	sample = sample_format;
@@ -71,8 +80,8 @@ static void test_builder(struct container_context *cntr,
 	container_context_destroy(cntr);
 }
 
-static void test_parser(struct container_context *cntr,
-		        enum container_format format, const char *const name,
+static void test_parser(struct container_context *cntr, int fd,
+			enum container_format format,
 		        snd_pcm_access_t access, snd_pcm_format_t sample_format,
 		        unsigned int samples_per_frame,
 		        unsigned int frames_per_second,
@@ -86,7 +95,7 @@ static void test_parser(struct container_context *cntr,
 	unsigned int handled_frame_count;
 	int err;
 
-	err = container_parser_init(cntr, name, verbose);
+	err = container_parser_init(cntr, fd, verbose);
 	assert(err == 0);
 
 	sample = sample_format;
@@ -142,112 +151,128 @@ static int callback(struct test_generator *gen, snd_pcm_access_t access,
 	if (buf == NULL)
 		return -ENOMEM;
 
-	// Remove a result of a previous trial.
-	unlink(name);
-
 	for (i = 0; i < ARRAY_SIZE(entries); ++i) {
+		int fd;
+		off64_t pos;
+
 		frames_per_second = entries[i];
 
-		test_builder(&trial->cntr, trial->format, name, access,
+#ifdef HAVE_MEMFD_CREATE
+		fd = memfd_create(name, 0);
+#else
+		fd = open(name, O_RDWR | O_CREAT | O_TRUNC, 0644);
+#endif
+		if (fd < 0) {
+			err = -errno;
+			break;
+		}
+
+		test_builder(&trial->cntr, fd, trial->format, access,
 			     sample_format, samples_per_frame,
 			     frames_per_second, frame_buffer, frame_count,
 			     trial->verbose);
 
-		test_parser(&trial->cntr, trial->format, name, access,
+		pos = lseek64(fd, 0, SEEK_SET);
+		if (pos < 0) {
+			err = -errno;
+			break;
+		}
+
+		test_parser(&trial->cntr, fd, trial->format, access,
 			    sample_format, samples_per_frame, frames_per_second,
 			    buf, frame_count, trial->verbose);
 
 		err = memcmp(buf, frame_buffer, size);
 		assert(err == 0);
 
-		unlink(name);
+		close(fd);
 	}
 
 	free(buf);
 
-	return 0;
+	return err;
 }
 
 int main(int argc, const char *argv[])
 {
 	static const uint64_t sample_format_masks[] = {
 		[CONTAINER_FORMAT_RIFF_WAVE] =
-			(1ul << SND_PCM_FORMAT_U8) |
-			(1ul << SND_PCM_FORMAT_S16_LE) |
-			(1ul << SND_PCM_FORMAT_S16_BE) |
-			(1ul << SND_PCM_FORMAT_S24_LE) |
-			(1ul << SND_PCM_FORMAT_S24_BE) |
-			(1ul << SND_PCM_FORMAT_S32_LE) |
-			(1ul << SND_PCM_FORMAT_S32_BE) |
-			(1ul << SND_PCM_FORMAT_FLOAT_LE) |
-			(1ul << SND_PCM_FORMAT_FLOAT_BE) |
-			(1ul << SND_PCM_FORMAT_FLOAT64_LE) |
-			(1ul << SND_PCM_FORMAT_FLOAT64_BE) |
-			(1ul << SND_PCM_FORMAT_MU_LAW) |
-			(1ul << SND_PCM_FORMAT_A_LAW) |
-			(1ul << SND_PCM_FORMAT_S24_3LE) |
-			(1ul << SND_PCM_FORMAT_S24_3BE) |
-			(1ul << SND_PCM_FORMAT_S20_3LE) |
-			(1ul << SND_PCM_FORMAT_S20_3BE) |
-			(1ul << SND_PCM_FORMAT_S18_3LE) |
-			(1ul << SND_PCM_FORMAT_S18_3BE),
+			(1ull << SND_PCM_FORMAT_U8) |
+			(1ull << SND_PCM_FORMAT_S16_LE) |
+			(1ull << SND_PCM_FORMAT_S16_BE) |
+			(1ull << SND_PCM_FORMAT_S24_LE) |
+			(1ull << SND_PCM_FORMAT_S24_BE) |
+			(1ull << SND_PCM_FORMAT_S32_LE) |
+			(1ull << SND_PCM_FORMAT_S32_BE) |
+			(1ull << SND_PCM_FORMAT_FLOAT_LE) |
+			(1ull << SND_PCM_FORMAT_FLOAT_BE) |
+			(1ull << SND_PCM_FORMAT_FLOAT64_LE) |
+			(1ull << SND_PCM_FORMAT_FLOAT64_BE) |
+			(1ull << SND_PCM_FORMAT_MU_LAW) |
+			(1ull << SND_PCM_FORMAT_A_LAW) |
+			(1ull << SND_PCM_FORMAT_S24_3LE) |
+			(1ull << SND_PCM_FORMAT_S24_3BE) |
+			(1ull << SND_PCM_FORMAT_S20_3LE) |
+			(1ull << SND_PCM_FORMAT_S20_3BE) |
+			(1ull << SND_PCM_FORMAT_S18_3LE) |
+			(1ull << SND_PCM_FORMAT_S18_3BE),
 		[CONTAINER_FORMAT_AU] =
-			(1ul << SND_PCM_FORMAT_S8) |
-			(1ul << SND_PCM_FORMAT_S16_BE) |
-			(1ul << SND_PCM_FORMAT_S32_BE) |
-			(1ul << SND_PCM_FORMAT_FLOAT_BE) |
-			(1ul << SND_PCM_FORMAT_FLOAT64_BE) |
-			(1ul << SND_PCM_FORMAT_MU_LAW) |
-			(1ul << SND_PCM_FORMAT_A_LAW),
+			(1ull << SND_PCM_FORMAT_S8) |
+			(1ull << SND_PCM_FORMAT_S16_BE) |
+			(1ull << SND_PCM_FORMAT_S32_BE) |
+			(1ull << SND_PCM_FORMAT_FLOAT_BE) |
+			(1ull << SND_PCM_FORMAT_FLOAT64_BE) |
+			(1ull << SND_PCM_FORMAT_MU_LAW) |
+			(1ull << SND_PCM_FORMAT_A_LAW),
 		[CONTAINER_FORMAT_VOC] =
-			(1ul << SND_PCM_FORMAT_U8) |
-			(1ul << SND_PCM_FORMAT_S16_LE) |
-			(1ul << SND_PCM_FORMAT_MU_LAW) |
-			(1ul << SND_PCM_FORMAT_A_LAW),
+			(1ull << SND_PCM_FORMAT_U8) |
+			(1ull << SND_PCM_FORMAT_S16_LE) |
+			(1ull << SND_PCM_FORMAT_MU_LAW) |
+			(1ull << SND_PCM_FORMAT_A_LAW),
 		[CONTAINER_FORMAT_RAW] =
-			(1ul << SND_PCM_FORMAT_S8) |
-			(1ul << SND_PCM_FORMAT_U8) |
-			(1ul << SND_PCM_FORMAT_S16_LE) |
-			(1ul << SND_PCM_FORMAT_S16_BE) |
-			(1ul << SND_PCM_FORMAT_U16_LE) |
-			(1ul << SND_PCM_FORMAT_U16_BE) |
-			(1ul << SND_PCM_FORMAT_S24_LE) |
-			(1ul << SND_PCM_FORMAT_S24_BE) |
-			(1ul << SND_PCM_FORMAT_U24_LE) |
-			(1ul << SND_PCM_FORMAT_U24_BE) |
-			(1ul << SND_PCM_FORMAT_S32_LE) |
-			(1ul << SND_PCM_FORMAT_S32_BE) |
-			(1ul << SND_PCM_FORMAT_U32_LE) |
-			(1ul << SND_PCM_FORMAT_U32_BE) |
-			(1ul << SND_PCM_FORMAT_FLOAT_LE) |
-			(1ul << SND_PCM_FORMAT_FLOAT_BE) |
-			(1ul << SND_PCM_FORMAT_FLOAT64_LE) |
-			(1ul << SND_PCM_FORMAT_FLOAT64_BE) |
-			(1ul << SND_PCM_FORMAT_IEC958_SUBFRAME_LE) |
-			(1ul << SND_PCM_FORMAT_IEC958_SUBFRAME_BE) |
-			(1ul << SND_PCM_FORMAT_MU_LAW) |
-			(1ul << SND_PCM_FORMAT_A_LAW) |
-			(1ul << SND_PCM_FORMAT_S24_3LE) |
-			(1ul << SND_PCM_FORMAT_S24_3BE) |
-			(1ul << SND_PCM_FORMAT_U24_3LE) |
-			(1ul << SND_PCM_FORMAT_U24_3BE) |
-			(1ul << SND_PCM_FORMAT_S20_3LE) |
-			(1ul << SND_PCM_FORMAT_S20_3BE) |
-			(1ul << SND_PCM_FORMAT_U20_3LE) |
-			(1ul << SND_PCM_FORMAT_U20_3BE) |
-			(1ul << SND_PCM_FORMAT_S18_3LE) |
-			(1ul << SND_PCM_FORMAT_S18_3BE) |
-			(1ul << SND_PCM_FORMAT_U18_3LE) |
-			(1ul << SND_PCM_FORMAT_U18_3BE) |
-			(1ul << SND_PCM_FORMAT_DSD_U8) |
-			(1ul << SND_PCM_FORMAT_DSD_U16_LE) |
-			(1ul << SND_PCM_FORMAT_DSD_U32_LE) |
-			(1ul << SND_PCM_FORMAT_DSD_U16_BE) |
-			(1ul << SND_PCM_FORMAT_DSD_U32_BE),
+			(1ull << SND_PCM_FORMAT_S8) |
+			(1ull << SND_PCM_FORMAT_U8) |
+			(1ull << SND_PCM_FORMAT_S16_LE) |
+			(1ull << SND_PCM_FORMAT_S16_BE) |
+			(1ull << SND_PCM_FORMAT_U16_LE) |
+			(1ull << SND_PCM_FORMAT_U16_BE) |
+			(1ull << SND_PCM_FORMAT_S24_LE) |
+			(1ull << SND_PCM_FORMAT_S24_BE) |
+			(1ull << SND_PCM_FORMAT_U24_LE) |
+			(1ull << SND_PCM_FORMAT_U24_BE) |
+			(1ull << SND_PCM_FORMAT_S32_LE) |
+			(1ull << SND_PCM_FORMAT_S32_BE) |
+			(1ull << SND_PCM_FORMAT_U32_LE) |
+			(1ull << SND_PCM_FORMAT_U32_BE) |
+			(1ull << SND_PCM_FORMAT_FLOAT_LE) |
+			(1ull << SND_PCM_FORMAT_FLOAT_BE) |
+			(1ull << SND_PCM_FORMAT_FLOAT64_LE) |
+			(1ull << SND_PCM_FORMAT_FLOAT64_BE) |
+			(1ull << SND_PCM_FORMAT_IEC958_SUBFRAME_LE) |
+			(1ull << SND_PCM_FORMAT_IEC958_SUBFRAME_BE) |
+			(1ull << SND_PCM_FORMAT_MU_LAW) |
+			(1ull << SND_PCM_FORMAT_A_LAW) |
+			(1ull << SND_PCM_FORMAT_S24_3LE) |
+			(1ull << SND_PCM_FORMAT_S24_3BE) |
+			(1ull << SND_PCM_FORMAT_U24_3LE) |
+			(1ull << SND_PCM_FORMAT_U24_3BE) |
+			(1ull << SND_PCM_FORMAT_S20_3LE) |
+			(1ull << SND_PCM_FORMAT_S20_3BE) |
+			(1ull << SND_PCM_FORMAT_U20_3LE) |
+			(1ull << SND_PCM_FORMAT_U20_3BE) |
+			(1ull << SND_PCM_FORMAT_S18_3LE) |
+			(1ull << SND_PCM_FORMAT_S18_3BE) |
+			(1ull << SND_PCM_FORMAT_U18_3LE) |
+			(1ull << SND_PCM_FORMAT_U18_3BE) |
+			(1ull << SND_PCM_FORMAT_DSD_U8) |
+			(1ull << SND_PCM_FORMAT_DSD_U16_LE) |
+			(1ull << SND_PCM_FORMAT_DSD_U32_LE) |
+			(1ull << SND_PCM_FORMAT_DSD_U16_BE) |
+			(1ull << SND_PCM_FORMAT_DSD_U32_BE),
 	};
 	static const uint64_t access_mask =
-		(1ul << SND_PCM_ACCESS_MMAP_INTERLEAVED) |
-		(1ul << SND_PCM_ACCESS_RW_INTERLEAVED);
+		(1ull << SND_PCM_ACCESS_MMAP_INTERLEAVED) |
+		(1ull << SND_PCM_ACCESS_RW_INTERLEAVED);
 	struct test_generator gen = {0};
 	struct container_trial *trial;
 	int i;
@@ -275,7 +300,7 @@ int main(int argc, const char *argv[])
 	for (i = begin; i < end; ++i) {
 		err = generator_context_init(&gen, access_mask,
 					     sample_format_masks[i],
-					     1, 128, 23, 4500, 1024,
+					     1, 32, 23, 3000, 512,
 					     sizeof(struct container_trial));
 		if (err >= 0) {
 			trial = gen.private_data;

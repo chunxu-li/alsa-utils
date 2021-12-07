@@ -44,7 +44,7 @@
 #include <assert.h>
 #include <termios.h>
 #include <signal.h>
-#include <sys/poll.h>
+#include <poll.h>
 #include <sys/uio.h>
 #include <sys/time.h>
 #include <sys/stat.h>
@@ -53,6 +53,8 @@
 #include "gettext.h"
 #include "formats.h"
 #include "version.h"
+
+#define ABS(a)  (a) < 0 ? -(a) : (a)
 
 #ifdef SND_CHMAP_API_VERSION
 #define CONFIG_SUPPORT_CHMAP	1
@@ -184,13 +186,13 @@ static const struct fmt_capture {
 
 #if __GNUC__ > 2 || (__GNUC__ == 2 && __GNUC_MINOR__ >= 95)
 #define error(...) do {\
-	fprintf(stderr, "%s: %s:%d: ", command, __FUNCTION__, __LINE__); \
+	fprintf(stderr, "%s: %s:%d: ", command, __func__, __LINE__); \
 	fprintf(stderr, __VA_ARGS__); \
 	putc('\n', stderr); \
 } while (0)
 #else
 #define error(args...) do {\
-	fprintf(stderr, "%s: %s:%d: ", command, __FUNCTION__, __LINE__); \
+	fprintf(stderr, "%s: %s:%d: ", command, __func__, __LINE__); \
 	fprintf(stderr, ##args); \
 	putc('\n', stderr); \
 } while (0)
@@ -440,7 +442,7 @@ static ssize_t xwrite(int fd, const void *buf, size_t count)
 	size_t offset = 0;
 
 	while (offset < count) {
-		written = write(fd, buf + offset, count - offset);
+		written = write(fd, (char *)buf + offset, count - offset);
 		if (written <= 0)
 			return written;
 
@@ -523,7 +525,7 @@ int main(int argc, char *argv[])
 	};
 	char *pcm_name = "default";
 	int tmp, err, c;
-	int do_device_list = 0, do_pcm_list = 0;
+	int do_device_list = 0, do_pcm_list = 0, force_sample_format = 0;
 	snd_pcm_info_t *info;
 	FILE *direction;
 
@@ -610,6 +612,7 @@ int main(int argc, char *argv[])
 			}
 			break;
 		case 'f':
+			force_sample_format = 1;
 			if (strcasecmp(optarg, "cd") == 0 || strcasecmp(optarg, "cdr") == 0) {
 				if (strcasecmp(optarg, "cdr") == 0)
 					rhwparams.format = SND_PCM_FORMAT_S16_BE;
@@ -841,6 +844,14 @@ int main(int argc, char *argv[])
 			return 1;
 		}
 	}
+
+	if (!force_sample_format &&
+	    isatty(fileno(stdin)) &&
+	    stream == SND_PCM_STREAM_CAPTURE &&
+	    snd_pcm_format_width(rhwparams.format) <= 8)
+		fprintf(stderr, "Warning: Some sources (like microphones) may produce inaudiable results\n"
+				"         with 8-bit sampling. Use '-f' argument to increase resolution\n"
+				"         e.g. '-f S16_LE'.\n");
 
 	chunk_size = 1024;
 	hwparams = rhwparams;
@@ -1208,7 +1219,7 @@ static int test_au(int fd, void *buffer)
 	hwparams.channels = BE_INT(ap->channels);
 	if (hwparams.channels < 1 || hwparams.channels > 256)
 		return -1;
-	if ((size_t)safe_read(fd, buffer + sizeof(AuHeader), BE_INT(ap->hdr_size) - sizeof(AuHeader)) != BE_INT(ap->hdr_size) - sizeof(AuHeader)) {
+	if ((size_t)safe_read(fd, (char *)buffer + sizeof(AuHeader), BE_INT(ap->hdr_size) - sizeof(AuHeader)) != BE_INT(ap->hdr_size) - sizeof(AuHeader)) {
 		error(_("read error"));
 		prg_exit(EXIT_FAILURE);
 	}
@@ -1282,7 +1293,7 @@ static int setup_chmap(void)
 		}
 		if (i >= hw_chmap->channels) {
 			char buf[256];
-			error(_("Channel %d doesn't match with hw_parmas"), ch);
+			error(_("Channel %d doesn't match with hw_params"), ch);
 			snd_pcm_chmap_print(hw_chmap, sizeof(buf), buf);
 			fprintf(stderr, "hardware chmap = %s\n", buf);
 			free(hw_chmap);
@@ -1526,6 +1537,19 @@ static void done_stdin(void)
 	tcsetattr(fileno(stdin), TCSANOW, &term);
 }
 
+static char wait_for_input(void)
+{
+	struct pollfd pfd;
+	unsigned char b;
+
+	do {
+		pfd.fd = fileno(stdin);
+		pfd.events = POLLIN;
+		poll(&pfd, 1, -1);
+	} while (read(fileno(stdin), &b, 1) != 1);
+	return b;
+}
+
 static void do_pause(void)
 {
 	int err;
@@ -1544,7 +1568,7 @@ static void do_pause(void)
 		return;
 	}
 	while (1) {
-		while (read(fileno(stdin), &b, 1) != 1);
+		b = wait_for_input();
 		if (b == ' ' || b == '\r') {
 			while (read(fileno(stdin), &b, 1) == 1);
 			if (snd_pcm_state(handle) == SND_PCM_STATE_SUSPENDED)
@@ -1569,7 +1593,7 @@ static void check_stdin(void)
 				while (read(fileno(stdin), &b, 1) == 1);
 				fprintf(stderr, _("\r=== PAUSE ===                                                            "));
 				fflush(stderr);
-			do_pause();
+				do_pause();
 				fprintf(stderr, "                                                                          \r");
 				fflush(stderr);
 			}
@@ -1649,7 +1673,8 @@ static void xrun(void)
 			prg_exit(EXIT_FAILURE);
 		}
 		return;		/* ok, data should be accepted again */
-	} if (snd_pcm_status_get_state(status) == SND_PCM_STATE_DRAINING) {
+	}
+	if (snd_pcm_status_get_state(status) == SND_PCM_STATE_DRAINING) {
 		if (verbose) {
 			fprintf(stderr, _("Status(DRAINING):\n"));
 			snd_pcm_status_dump(status, log);
@@ -1733,15 +1758,17 @@ static void print_vu_meter_stereo(int *perc, int *maxperc)
 		if (c)
 			memset(line + bar_length + 6 + 1, '#', p);
 		else
-			memset(line + bar_length - p - 1, '#', p);
-		p = maxperc[c] * bar_length / 100;
-		if (p > bar_length)
-			p = bar_length;
+			memset(line + bar_length - p, '#', p);
+		p = maxperc[c] * bar_length / 100 - 1;
+		if (p < 0)
+			p = 0;
+		else if (p >= bar_length)
+			p = bar_length - 1;
 		if (c)
 			line[bar_length + 6 + 1 + p] = '+';
 		else
 			line[bar_length - p - 1] = '+';
-		if (maxperc[c] > 99)
+		if (ABS(maxperc[c]) > 99)
 			sprintf(tmp, "MAX");
 		else
 			sprintf(tmp, "%02d%%", maxperc[c]);
@@ -1763,12 +1790,12 @@ static void print_vu_meter(signed int *perc, signed int *maxperc)
 }
 
 /* peak handler */
-static void compute_max_peak(u_char *data, size_t count)
+static void compute_max_peak(u_char *data, size_t samples)
 {
 	signed int val, max, perc[2], max_peak[2];
-	static	int	run = 0;
-	size_t ocount = count;
-	int	format_little_endian = snd_pcm_format_little_endian(hwparams.format);	
+	static int run = 0;
+	size_t osamples = samples;
+	int format_little_endian = snd_pcm_format_little_endian(hwparams.format);
 	int ichans, c;
 
 	if (vumeter == VUMETER_STEREO)
@@ -1782,7 +1809,7 @@ static void compute_max_peak(u_char *data, size_t count)
 		signed char *valp = (signed char *)data;
 		signed char mask = snd_pcm_format_silence(hwparams.format);
 		c = 0;
-		while (count-- > 0) {
+		while (samples-- > 0) {
 			val = *valp++ ^ mask;
 			val = abs(val);
 			if (max_peak[c] < val)
@@ -1797,16 +1824,16 @@ static void compute_max_peak(u_char *data, size_t count)
 		signed short mask = snd_pcm_format_silence_16(hwparams.format);
 		signed short sval;
 
-		count /= 2;
 		c = 0;
-		while (count-- > 0) {
+		while (samples-- > 0) {
 			if (format_little_endian)
 				sval = le16toh(*valp);
 			else
 				sval = be16toh(*valp);
-			sval = abs(sval) ^ mask;
-			if (max_peak[c] < sval)
-				max_peak[c] = sval;
+			sval ^= mask;
+			val = abs(sval);
+			if (max_peak[c] < val)
+				max_peak[c] = val;
 			valp++;
 			if (vumeter == VUMETER_STEREO)
 				c = !c;
@@ -1817,19 +1844,19 @@ static void compute_max_peak(u_char *data, size_t count)
 		unsigned char *valp = data;
 		signed int mask = snd_pcm_format_silence_32(hwparams.format);
 
-		count /= 3;
 		c = 0;
-		while (count-- > 0) {
+		while (samples-- > 0) {
 			if (format_little_endian) {
 				val = valp[0] | (valp[1]<<8) | (valp[2]<<16);
 			} else {
 				val = (valp[0]<<16) | (valp[1]<<8) | valp[2];
 			}
+			val ^= mask;
 			/* Correct signed bit in 32-bit value */
 			if (val & (1<<(bits_per_sample-1))) {
 				val |= 0xff<<24;	/* Negate upper bits too */
 			}
-			val = abs(val) ^ mask;
+			val = abs(val);
 			if (max_peak[c] < val)
 				max_peak[c] = val;
 			valp += 3;
@@ -1842,14 +1869,17 @@ static void compute_max_peak(u_char *data, size_t count)
 		signed int *valp = (signed int *)data;
 		signed int mask = snd_pcm_format_silence_32(hwparams.format);
 
-		count /= 4;
 		c = 0;
-		while (count-- > 0) {
+		while (samples-- > 0) {
 			if (format_little_endian)
 				val = le32toh(*valp);
 			else
 				val = be32toh(*valp);
-			val = abs(val) ^ mask;
+			val ^= mask;
+			if (val == 0x80000000U)
+				val = 0x7fffffff;
+			else
+				val = abs(val);
 			if (max_peak[c] < val)
 				max_peak[c] = val;
 			valp++;
@@ -1870,6 +1900,8 @@ static void compute_max_peak(u_char *data, size_t count)
 		max = 0x7fffffff;
 
 	for (c = 0; c < ichans; c++) {
+		if (max_peak[c] > max)
+			max_peak[c] = max;
 		if (bits_per_sample > 16)
 			perc[c] = max_peak[c] / (max / 100);
 		else
@@ -1893,8 +1925,8 @@ static void compute_max_peak(u_char *data, size_t count)
 		print_vu_meter(perc, maxperc);
 		fflush(stderr);
 	}
-	else if(verbose==3) {
-		fprintf(stderr, _("Max peak (%li samples): 0x%08x "), (long)ocount, max_peak[0]);
+	else if (verbose==3) {
+		fprintf(stderr, _("Max peak (%li samples): 0x%08x "), (long)osamples, max_peak[0]);
 		for (val = 0; val < 20; val++)
 			if (val <= perc[0] / 5)
 				putc('#', stderr);
@@ -1915,22 +1947,46 @@ static void do_test_position(void)
 	static snd_pcm_sframes_t minavail, mindelay;
 	static snd_pcm_sframes_t badavail = 0, baddelay = 0;
 	snd_pcm_sframes_t outofrange;
-	snd_pcm_sframes_t avail, delay;
+	snd_pcm_sframes_t avail, delay, savail, sdelay;
+	snd_pcm_status_t *status;
 	int err;
 
+	snd_pcm_status_alloca(&status);
 	err = snd_pcm_avail_delay(handle, &avail, &delay);
 	if (err < 0)
 		return;
+	err = snd_pcm_status(handle, status);
+	if (err < 0)
+		return;
+	savail = snd_pcm_status_get_avail(status);
+	sdelay = snd_pcm_status_get_delay(status);
 	outofrange = (test_coef * (snd_pcm_sframes_t)buffer_frames) / 2;
 	if (avail > outofrange || avail < -outofrange ||
 	    delay > outofrange || delay < -outofrange) {
-	  badavail = avail; baddelay = delay;
-	  availsum = delaysum = samples = 0;
-	  maxavail = maxdelay = 0;
-	  minavail = mindelay = buffer_frames * 16;
-	  fprintf(stderr, _("Suspicious buffer position (%li total): "
-	  	"avail = %li, delay = %li, buffer = %li\n"),
-	  	++counter, (long)avail, (long)delay, (long)buffer_frames);
+		badavail = avail; baddelay = delay;
+		availsum = delaysum = samples = 0;
+		maxavail = maxdelay = 0;
+		minavail = mindelay = buffer_frames * 16;
+		fprintf(stderr, _("Suspicious buffer position (%li total): "
+			"avail = %li, delay = %li, buffer = %li\n"),
+			++counter, (long)avail, (long)delay, (long)buffer_frames);
+	} else if (savail > outofrange || savail < -outofrange ||
+		   sdelay > outofrange || sdelay < -outofrange) {
+		badavail = savail; baddelay = sdelay;
+		availsum = delaysum = samples = 0;
+		maxavail = maxdelay = 0;
+		minavail = mindelay = buffer_frames * 16;
+		fprintf(stderr, _("Suspicious status buffer position (%li total): "
+			"avail = %li, delay = %li, buffer = %li\n"),
+			++counter, (long)savail, (long)sdelay, (long)buffer_frames);
+	} else if (stream == SND_PCM_STREAM_CAPTURE && avail > delay) {
+		fprintf(stderr, _("Suspicious buffer position avail > delay (%li total): "
+			"avail = %li, delay = %li\n"),
+			++counter, (long)avail, (long)delay);
+	} else if (stream == SND_PCM_STREAM_CAPTURE && savail > sdelay) {
+		fprintf(stderr, _("Suspicious status buffer position avail > delay (%li total): "
+			"avail = %li, delay = %li\n"),
+			++counter, (long)savail, (long)sdelay);
 	} else if (verbose) {
 		time(&now);
 		if (tmr == (time_t) -1) {
@@ -1941,19 +1997,27 @@ static void do_test_position(void)
 		}
 		if (avail > maxavail)
 			maxavail = avail;
+		if (savail > maxavail)
+			maxavail = savail;
 		if (delay > maxdelay)
 			maxdelay = delay;
+		if (sdelay > maxdelay)
+			maxdelay = sdelay;
 		if (avail < minavail)
 			minavail = avail;
+		if (savail < minavail)
+			minavail = savail;
 		if (delay < mindelay)
 			mindelay = delay;
+		if (sdelay < mindelay)
+			mindelay = sdelay;
 		availsum += avail;
 		delaysum += delay;
 		samples++;
-		if (avail != 0 && now != tmr) {
+		if ((maxavail != 0 || maxdelay != 0) && now != tmr) {
 			fprintf(stderr, "BUFPOS: avg%li/%li "
 				"min%li/%li max%li/%li (%li) (%li:%li/%li)\n",
-				(long)(availsum / samples),
+                         (long)(availsum / samples),
 				(long)(delaysum / samples),
 				(long)minavail, (long)mindelay,
 				(long)maxavail, (long)maxdelay,
@@ -1961,6 +2025,10 @@ static void do_test_position(void)
 				counter, badavail, baddelay);
 			tmr = now;
 		}
+	}
+	if (verbose == 1) {
+		fprintf(stderr, _("Status(R/W) (standalone avail=%li delay=%li):\n"), (long)avail, (long)delay);
+		snd_pcm_status_dump(status, log);
 	}
 }
 
@@ -2133,7 +2201,9 @@ static ssize_t pcm_read(u_char *data, size_t rcount)
 		count = chunk_size;
 	}
 
-	while (count > 0 && !in_aborting) {
+	while (count > 0) {
+		if (in_aborting)
+			goto abort;
 		if (test_position)
 			do_test_position();
 		check_stdin();
@@ -2159,6 +2229,7 @@ static ssize_t pcm_read(u_char *data, size_t rcount)
 			data += r * bits_per_frame / 8;
 		}
 	}
+abort:
 	return rcount;
 }
 
@@ -2172,7 +2243,9 @@ static ssize_t pcm_readv(u_char **data, unsigned int channels, size_t rcount)
 		count = chunk_size;
 	}
 
-	while (count > 0 && !in_aborting) {
+	while (count > 0) {
+		if (in_aborting)
+			goto abort;
 		unsigned int channel;
 		void *bufs[channels];
 		size_t offset = result;
@@ -2204,6 +2277,7 @@ static ssize_t pcm_readv(u_char **data, unsigned int channels, size_t rcount)
 			count -= r;
 		}
 	}
+abort:
 	return rcount;
 }
 
@@ -2490,7 +2564,9 @@ static void voc_play(int fd, int ofs, char *name)
 		}
 	}			/* while(1) */
       __end:
-        voc_pcm_flush();
+	if (!in_aborting) {
+		voc_pcm_flush();
+	}
         free(buf);
 }
 /* that was a big one, perhaps somebody split it :-) */
@@ -2805,9 +2881,11 @@ static void playback_go(int fd, size_t loaded, off64_t count, int rtype, char *n
 		written += r;
 		l = 0;
 	}
-	snd_pcm_nonblock(handle, 0);
-	snd_pcm_drain(handle);
-	snd_pcm_nonblock(handle, nonblock);
+	if (!in_aborting) {
+		snd_pcm_nonblock(handle, 0);
+		snd_pcm_drain(handle);
+		snd_pcm_nonblock(handle, nonblock);
+	}
 }
 
 static int read_header(int *loaded, int header_size)
@@ -3015,7 +3093,7 @@ static int new_capture_file(char *name, char *namebuf, size_t namelen,
 			    int filecount)
 {
 	char *s;
-	char buf[PATH_MAX+1];
+	char buf[PATH_MAX-10];
 	time_t t;
 	struct tm *tmp;
 
@@ -3035,6 +3113,7 @@ static int new_capture_file(char *name, char *namebuf, size_t namelen,
 
 	/* get a copy of the original filename */
 	strncpy(buf, name, sizeof(buf));
+	buf[sizeof(buf)-1] = '\0';
 
 	/* separate extension from filename */
 	s = buf + strlen(buf);
@@ -3122,7 +3201,7 @@ static void capture(char *orig_name)
 	int tostdout=0;		/* boolean which describes output stream */
 	int filecount=0;	/* number of files written */
 	char *name = orig_name;	/* current filename */
-	char namebuf[PATH_MAX+1];
+	char namebuf[PATH_MAX+2];
 	off64_t count, rest;		/* number of bytes to capture */
 	struct stat statbuf;
 
@@ -3197,11 +3276,12 @@ static void capture(char *orig_name)
 			size_t c = (rest <= (off64_t)chunk_bytes) ?
 				(size_t)rest : chunk_bytes;
 			size_t f = c * 8 / bits_per_frame;
-			if (pcm_read(audiobuf, f) != f) {
+			size_t read = pcm_read(audiobuf, f);
+			size_t save;
+			if (read != f)
 				in_aborting = 1;
-				break;
-			}
-			if (xwrite(fd, audiobuf, c) != c) {
+			save = read * bits_per_frame / 8;
+			if (xwrite(fd, audiobuf, save) != save) {
 				perror(name);
 				in_aborting = 1;
 				break;
@@ -3261,7 +3341,7 @@ static void playbackv_go(int* fds, unsigned int channels, size_t loaded, off64_t
 		do {
 			r = safe_read(fds[0], bufs[0], expected);
 			if (r < 0) {
-				perror(names[channel]);
+				perror(names[0]);
 				prg_exit(EXIT_FAILURE);
 			}
 			for (channel = 1; channel < channels; ++channel) {
@@ -3281,9 +3361,11 @@ static void playbackv_go(int* fds, unsigned int channels, size_t loaded, off64_t
 		r = r * bits_per_frame / 8;
 		count -= r;
 	}
-	snd_pcm_nonblock(handle, 0);
-	snd_pcm_drain(handle);
-	snd_pcm_nonblock(handle, nonblock);
+	if (!in_aborting) {
+		snd_pcm_nonblock(handle, 0);
+		snd_pcm_drain(handle);
+		snd_pcm_nonblock(handle, nonblock);
+	}
 }
 
 static void capturev_go(int* fds, unsigned int channels, off64_t count, int rtype, char **names)
@@ -3346,7 +3428,7 @@ static void playbackv(char **names, unsigned int count)
 		}
 		alloced = 1;
 	} else if (count != channels) {
-		error(_("You need to specify %d files"), channels);
+		error(_("You need to specify %u files"), channels);
 		prg_exit(EXIT_FAILURE);
 	}
 

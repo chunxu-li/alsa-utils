@@ -27,7 +27,6 @@
 #include <stdio.h>
 #include <assert.h>
 #include <errno.h>
-#include <alsa/asoundlib.h>
 #include "alsactl.h"
 
 
@@ -230,7 +229,7 @@ static int get_control(snd_ctl_t *handle, snd_ctl_elem_id_t *id, snd_config_t *t
 {
 	snd_ctl_elem_value_t *ctl;
 	snd_ctl_elem_info_t *info;
-	snd_config_t *control, *comment, *item, *value;
+	snd_config_t *control, *comment, *item = NULL, *value;
 	const char *s;
 	char buf[256];
 	unsigned int idx;
@@ -336,9 +335,9 @@ static int get_control(snd_ctl_t *handle, snd_ctl_elem_id_t *id, snd_config_t *t
 		long long max = snd_ctl_elem_info_get_max64(info);
 		long long step = snd_ctl_elem_info_get_step64(info);
 		if (step)
-			sprintf(buf, "%Li - %Li (step %Li)", min, max, step);
+			sprintf(buf, "%lli - %lli (step %lli)", min, max, step);
 		else
-			sprintf(buf, "%Li - %Li", min, max);
+			sprintf(buf, "%lli - %lli", min, max);
 		err = snd_config_string_add(comment, "range", buf);
 		if (err < 0) {
 			error("snd_config_string_add: %s", snd_strerror(err));
@@ -656,13 +655,16 @@ static long config_iface(snd_config_t *n)
 	const char *str;
 	switch (snd_config_get_type(n)) {
 	case SND_CONFIG_TYPE_INTEGER:
-		snd_config_get_integer(n, &i);
+		if (snd_config_get_integer(n, &i) < 0)
+			return -1;
 		return i;
 	case SND_CONFIG_TYPE_INTEGER64:
-		snd_config_get_integer64(n, &li);
+		if (snd_config_get_integer64(n, &li) < 0)
+			return -1;
 		return li;
 	case SND_CONFIG_TYPE_STRING:
-		snd_config_get_string(n, &str);
+		if (snd_config_get_string(n, &str) < 0)
+			return -1;
 		break;
 	default:
 		return -1;
@@ -682,17 +684,20 @@ static int config_bool(snd_config_t *n, int doit)
 
 	switch (snd_config_get_type(n)) {
 	case SND_CONFIG_TYPE_INTEGER:
-		snd_config_get_integer(n, &val);
+		if (snd_config_get_integer(n, &val) < 0)
+			return -1;
 		if (val < 0 || val > 1)
 			return -1;
 		return val;
 	case SND_CONFIG_TYPE_INTEGER64:
-		snd_config_get_integer64(n, &lval);
+		if (snd_config_get_integer64(n, &lval) < 0)
+			return -1;
 		if (lval < 0 || lval > 1)
 			return -1;
 		return (int) lval;
 	case SND_CONFIG_TYPE_STRING:
-		snd_config_get_string(n, &str);
+		if (snd_config_get_string(n, &str) < 0)
+			return -1;
 		break;
 	case SND_CONFIG_TYPE_COMPOUND:
 		if (!force_restore || !doit)
@@ -719,13 +724,16 @@ static int config_enumerated(snd_config_t *n, snd_ctl_t *handle,
 
 	switch (snd_config_get_type(n)) {
 	case SND_CONFIG_TYPE_INTEGER:
-		snd_config_get_integer(n, &val);
+		if (snd_config_get_integer(n, &val) < 0)
+			return -1;
 		return val;
 	case SND_CONFIG_TYPE_INTEGER64:
-		snd_config_get_integer64(n, &lval);
+		if (snd_config_get_integer64(n, &lval) < 0)
+			return -1;
 		return (int) lval;
 	case SND_CONFIG_TYPE_STRING:
-		snd_config_get_string(n, &str);
+		if (snd_config_get_string(n, &str) < 0)
+			return -1;
 		break;
 	case SND_CONFIG_TYPE_COMPOUND:
 		if (!force_restore || !doit)
@@ -1248,6 +1256,8 @@ static int set_control(snd_ctl_t *handle, snd_config_t *control,
 		}
 		if (strcmp(fld, "iface") == 0) {
 			iface = (snd_ctl_elem_iface_t)config_iface(n);
+			if (iface < 0)
+				return -EINVAL;
 			continue;
 		}
 		if (strcmp(fld, "device") == 0) {
@@ -1255,7 +1265,8 @@ static int set_control(snd_ctl_t *handle, snd_config_t *control,
 				cerror(doit, "control.%d.%s is invalid", numid, fld);
 				return -EINVAL;
 			}
-			snd_config_get_integer(n, &device);
+			if (snd_config_get_integer(n, &device) < 0)
+				return -EINVAL;
 			continue;
 		}
 		if (strcmp(fld, "subdevice") == 0) {
@@ -1263,7 +1274,8 @@ static int set_control(snd_ctl_t *handle, snd_config_t *control,
 				cerror(doit, "control.%d.%s is invalid", numid, fld);
 				return -EINVAL;
 			}
-			snd_config_get_integer(n, &subdevice);
+			if (snd_config_get_integer(n, &subdevice) < 0)
+				return -EINVAL;
 			continue;
 		}
 		if (strcmp(fld, "name") == 0) {
@@ -1271,7 +1283,8 @@ static int set_control(snd_ctl_t *handle, snd_config_t *control,
 				cerror(doit, "control.%d.%s is invalid", numid, fld);
 				return -EINVAL;
 			}
-			snd_config_get_string(n, &name);
+			if (snd_config_get_string(n, &name) < 0)
+				return -EINVAL;
 			continue;
 		}
 		if (strcmp(fld, "index") == 0) {
@@ -1279,7 +1292,8 @@ static int set_control(snd_ctl_t *handle, snd_config_t *control,
 				cerror(doit, "control.%d.%s is invalid", numid, fld);
 				return -EINVAL;
 			}
-			snd_config_get_integer(n, &index);
+			if (snd_config_get_integer(n, &index) < 0)
+				return -EINVAL;
 			continue;
 		}
 		if (strcmp(fld, "value") == 0) {
@@ -1468,13 +1482,19 @@ static int set_controls(int card, snd_config_t *top, int doit)
 {
 	snd_ctl_t *handle;
 	snd_ctl_card_info_t *info;
+	snd_ctl_elem_list_t *list;
+	snd_ctl_elem_info_t *elem_info;
+	snd_ctl_elem_id_t *elem_id;
 	snd_config_t *control;
 	snd_config_iterator_t i, next;
-	int err, maxnumid = -1;
+	int err, maxnumid = -1, maxnumid2 = -1;
+	unsigned int idx, count = 0;
 	char name[32], tmpid[16];
 	const char *id;
 	snd_ctl_card_info_alloca(&info);
-
+	snd_ctl_elem_list_alloca(&list);
+	snd_ctl_elem_info_alloca(&elem_info);
+	snd_ctl_elem_id_alloca(&elem_id);
 	sprintf(name, "hw:%d", card);
 	dbg("device='%s', doit=%i", name, doit);
 	err = snd_ctl_open(&handle, name, 0);
@@ -1514,22 +1534,54 @@ static int set_controls(int card, snd_config_t *top, int doit)
 			goto _close;
 	}
 
-	dbg("maxnumid=%i", maxnumid);
-	/* check if we have additional controls in driver */
-	/* in this case we should go through init procedure */
-	if (!doit && maxnumid >= 0) {
-		snd_ctl_elem_info_t *info;
-		snd_ctl_elem_info_alloca(&info);
-		snd_ctl_elem_info_set_numid(info, maxnumid+1);
-		if (snd_ctl_elem_info(handle, info) == 0) {
-			/* not very informative */
-			/* but value is used for check only */
-			err = -EAGAIN;
-			dbg("more controls than maxnumid?");
-			goto _close;
+	if (doit)
+		goto _close;
+
+	err = snd_ctl_elem_list(handle, list);
+	if (err < 0) {
+		error("Cannot determine controls: %s", snd_strerror(err));
+		goto _close;
+	}
+	count = snd_ctl_elem_list_get_count(list);
+	dbg("list count: %u", count);
+	if (count == 0)
+		goto _check;
+	snd_ctl_elem_list_set_offset(list, 0);
+	if (snd_ctl_elem_list_alloc_space(list, count) < 0) {
+		error("No enough memory...");
+		goto _close;
+	}
+	if ((err = snd_ctl_elem_list(handle, list)) < 0) {
+		error("Cannot determine controls (2): %s", snd_strerror(err));
+		goto _free;
+	}
+	maxnumid2 = 0;
+	/* skip non-readable elements */
+	for (idx = 0; idx < count; ++idx) {
+		snd_ctl_elem_info_clear(elem_info);
+		snd_ctl_elem_list_get_id(list, idx, elem_id);
+		snd_ctl_elem_info_set_id(elem_info, elem_id);
+		if (snd_ctl_elem_info(handle, elem_info) == 0) {
+			if (!snd_ctl_elem_info_is_readable(elem_info))
+				continue;
+			maxnumid2++;
 		}
 	}
 
+	/* check if we have additional controls in driver */
+	/* in this case we should go through init procedure */
+ _check:
+	dbg("maxnumid=%i maxnumid2=%i", maxnumid, maxnumid2);
+	if (maxnumid >= 0 && maxnumid != maxnumid2) {
+		/* not very informative */
+		/* but value is used for check only */
+		err = -EAGAIN;
+		dbg("more controls than maxnumid?");
+	}
+
+ _free:
+	if (count >= 0)
+		snd_ctl_elem_list_free_space(list);
  _close:
 	snd_ctl_close(handle);
 	dbg("result code: %i", err);
@@ -1545,6 +1597,7 @@ int save_state(const char *file, const char *cardname)
 	int stdio;
 	char *nfile = NULL;
 	int lock_fd = -EINVAL;
+	struct snd_card_iterator iter;
 
 	err = snd_config_top(&config);
 	if (err < 0) {
@@ -1578,45 +1631,18 @@ int save_state(const char *file, const char *cardname)
 #endif
 	}
 
-	if (!cardname) {
-		int card, first = 1;
-
-		card = -1;
-		/* find each installed soundcards */
-		while (1) {
-			if (snd_card_next(&card) < 0)
-				break;
-			if (card < 0) {
-				if (first) {
-					if (ignore_nocards) {
-						err = 0;
-						goto out;
-					} else {
-						error("No soundcards found...");
-						err = -ENODEV;
-						goto out;
-					}
-				}
-				break;
-			}
-			first = 0;
-			if ((err = get_controls(card, config)))
-				goto out;
-		}
-	} else {
-		int cardno;
-
-		cardno = snd_card_get_index(cardname);
-		if (cardno < 0) {
-			error("Cannot find soundcard '%s'...", cardname);
-			err = cardno;
+	err = snd_card_iterator_sinit(&iter, cardname);
+	if (err < 0)
+		goto out;
+	while (snd_card_iterator_next(&iter)) {
+		if ((err = get_controls(iter.card, config)))
 			goto out;
-		}
-		if ((err = get_controls(cardno, config))) {
-			goto out;
-		}
 	}
-	
+	if (iter.first) {
+		err = snd_card_iterator_error(&iter);
+		goto out;
+	}
+
 	if (stdio) {
 		err = snd_output_stdio_attach(&out, stdout, 0);
 	} else {
@@ -1645,142 +1671,67 @@ out:
 	return err;
 }
 
-int load_state(const char *file, const char *initfile, const char *cardname,
-	       int do_init)
+int load_state(const char *cfgdir, const char *file,
+	       const char *initfile, int initflags,
+	       const char *cardname, int do_init)
 {
-	int err, finalerr = 0;
+	int err, finalerr = 0, open_failed;
+	struct snd_card_iterator iter;
 	snd_config_t *config;
-	snd_input_t *in;
-	int stdio, lock_fd = -EINVAL;
+	const char *cardname1;
 
-	err = snd_config_top(&config);
-	if (err < 0) {
-		error("snd_config_top error: %s", snd_strerror(err));
+	config = NULL;
+	err = load_configuration(file, &config, &open_failed);
+	if (err < 0 && !open_failed)
 		return err;
-	}
-	stdio = !strcmp(file, "-");
-	if (stdio) {
-		err = snd_input_stdio_attach(&in, stdin, 0);
-	} else {
-		lock_fd = state_lock(file, 10);
-		err = lock_fd >= 0 ? snd_input_stdio_open(&in, file, "r") : lock_fd;
-	}
-	if (err >= 0) {
-		err = snd_config_load(config, in);
-		snd_input_close(in);
-		if (lock_fd >= 0)
-			state_unlock(lock_fd, file);
-		if (err < 0) {
-			error("snd_config_load error: %s", snd_strerror(err));
-			goto out;
-		}
-	} else {
-		int card, first = 1;
-		char cardname1[16];
 
-		if (lock_fd >= 0)
-		        state_unlock(lock_fd, file);
+	if (open_failed) {
 		error("Cannot open %s for reading: %s", file, snd_strerror(err));
 		finalerr = err;
-		if (cardname) {
-			card = snd_card_get_index(cardname);
-			if (card < 0) {
-				error("Cannot find soundcard '%s'...", cardname);
-				err = -ENODEV;
-				goto out;
-			}
-			goto single;
-		} else {
-			card = -1;
-		}
-		/* find each installed soundcards */
-		while (!cardname) {
-			if (snd_card_next(&card) < 0)
-				break;
-			if (card < 0)
-				break;
-single:
-			first = 0;
+
+		err = snd_card_iterator_sinit(&iter, cardname);
+		if (err < 0)
+			return err;
+		while ((cardname1 = snd_card_iterator_next(&iter)) != NULL) {
 			if (!do_init)
 				break;
-			sprintf(cardname1, "%i", card);
-			err = init(initfile, cardname1);
+			err = init(cfgdir, initfile, initflags | FLAG_UCM_FBOOT | FLAG_UCM_BOOT, cardname1);
 			if (err < 0) {
 				finalerr = err;
-				initfailed(card, "init", err);
+				initfailed(iter.card, "init", err);
 			}
-			initfailed(card, "restore", -ENOENT);
+			initfailed(iter.card, "restore", -ENOENT);
 		}
-		if (first)
-			finalerr = 0;	/* no cards, no error code */
 		err = finalerr;
+		if (iter.first)
+			err = 0;	/* no cards, no error code */
 		goto out;
 	}
 
-	if (!cardname) {
-		int card, first = 1;
-		char cardname1[16];
-
-		card = -1;
-		/* find each installed soundcards */
-		while (1) {
-			if (snd_card_next(&card) < 0)
-				break;
-			if (card < 0) {
-				if (first) {
-					if (ignore_nocards) {
-						err = 0;
-						goto out;
-					} else {
-						error("No soundcards found...");
-						err = -ENODEV;
-						goto out;
-					}
-				}
-				break;
-			}
-			first = 0;
-			/* do a check if controls matches state file */
- 			if (do_init && set_controls(card, config, 0)) {
-				sprintf(cardname1, "%i", card);
-				err = init(initfile, cardname1);
-				if (err < 0) {
-					initfailed(card, "init", err);
-					finalerr = err;
-				}
-			}
-			if ((err = set_controls(card, config, 1))) {
-				if (!force_restore)
-					finalerr = err;
-				initfailed(card, "restore", err);
-			}
-		}
-	} else {
-		int cardno;
-
-		cardno = snd_card_get_index(cardname);
-		if (cardno < 0) {
-			error("Cannot find soundcard '%s'...", cardname);
-			err = -ENODEV;
-			goto out;
-		}
+	err = snd_card_iterator_sinit(&iter, cardname);
+	if (err < 0)
+		goto out;
+	while ((cardname1 = snd_card_iterator_next(&iter)) != NULL) {
+		/* error is ignored */
+		init_ucm(initflags | FLAG_UCM_FBOOT, iter.card);
 		/* do a check if controls matches state file */
-		if (do_init && set_controls(cardno, config, 0)) {
-			err = init(initfile, cardname);
+		if (do_init && set_controls(iter.card, config, 0)) {
+			err = init(cfgdir, initfile, initflags | FLAG_UCM_BOOT, cardname1);
 			if (err < 0) {
-				initfailed(cardno, "init", err);
+				initfailed(iter.card, "init", err);
 				finalerr = err;
 			}
 		}
-		if ((err = set_controls(cardno, config, 1))) {
-			initfailed(cardno, "restore", err);
+		if ((err = set_controls(iter.card, config, 1))) {
 			if (!force_restore)
-				goto out;
+				finalerr = err;
+			initfailed(iter.card, "restore", err);
 		}
 	}
-	err = finalerr;
+	err = finalerr ? finalerr : snd_card_iterator_error(&iter);
 out:
-	snd_config_delete(config);
+	if (config)
+		snd_config_delete(config);
 	snd_config_update_free_global();
 	return err;
 }
